@@ -100,13 +100,66 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         reward = self.reward_scale * reward
         return reward
 
+    def _align_aux_with_target_dim(self, aux_tensor, target_tensor):
+        """
+        Align aux outputs (e.g., static_pred / value / action_strength)
+        with target output dimensionality after trainer-side f_dim slicing.
+
+        aux_tensor examples:
+            static_pred      [B, pred_len, N]
+            value            [B, N, 1] or [B, N]
+            action_strength  [B, N]
+        target_tensor:
+            batch_y_target or dynamic_pred after f_dim slicing
+
+        Returns:
+            aligned aux_tensor compatible with target output dimension C_tgt.
+        """
+        if aux_tensor is None:
+            return None
+
+        target_c = target_tensor.shape[-1]
+
+        # Case 1: prediction-like tensor [B, T, C]
+        if aux_tensor.dim() == 3 and aux_tensor.shape[1] == target_tensor.shape[1]:
+            aux_c = aux_tensor.shape[-1]
+            if aux_c == target_c:
+                return aux_tensor
+            # mimic the same slicing rule used in trainer outputs
+            if self.args.features == 'MS':
+                return aux_tensor[:, :, -target_c:]
+            else:
+                return aux_tensor[:, :, :target_c]
+
+        # Case 2: per-variable tensor [B, C]
+        if aux_tensor.dim() == 2:
+            aux_c = aux_tensor.shape[-1]
+            if aux_c == target_c:
+                return aux_tensor
+            if self.args.features == 'MS':
+                return aux_tensor[:, -target_c:]
+            else:
+                return aux_tensor[:, :target_c]
+
+        # Case 3: per-variable tensor [B, C, 1]
+        if aux_tensor.dim() == 3 and aux_tensor.shape[-1] == 1:
+            aux_c = aux_tensor.shape[1]
+            if aux_c == target_c:
+                return aux_tensor
+            if self.args.features == 'MS':
+                return aux_tensor[:, -target_c:, :]
+            else:
+                return aux_tensor[:, :target_c, :]
+
+        return aux_tensor
+
     def _compute_rl_losses(self, aux, dynamic_pred, batch_y_target, criterion):
         """
         Compute RL losses using real forecasting targets.
 
         Inputs:
             aux should contain:
-                - static_pred: [B, pred_len, C]
+                - static_pred: [B, pred_len, C_full] or aligned
                 - value: [B, N, 1] or compatible
                 - action_strength: [B, N]
         Returns:
@@ -127,8 +180,13 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             }
 
         static_pred = aux['static_pred']
-        value = aux['value']                    # [B, N, 1]
-        action_strength = aux['action_strength']  # [B, N]
+        value = aux['value']
+        action_strength = aux['action_strength']
+
+        # -------- IMPORTANT FIX: align aux tensors to trainer-side target dimensionality --------
+        static_pred = self._align_aux_with_target_dim(static_pred, batch_y_target)
+        value = self._align_aux_with_target_dim(value, batch_y_target)
+        action_strength = self._align_aux_with_target_dim(action_strength, batch_y_target)
 
         # Per-variable forecasting loss over prediction horizon
         # [B, pred_len, C] -> mean over time dim => [B, C]
