@@ -43,12 +43,13 @@ class SelectionActor(nn.Module):
         state: [B, N, state_dim]
 
     Output:
-        alpha: [B, N, 1]
-        beta:  [B, N, 1]
+        alpha: [B, N, 1]   (global per-variable scaling)
+        beta:  [B, N, L]   (time-aware additive bias)
     """
 
-    def __init__(self, state_dim, hidden_dim=64, alpha_scale=0.1, beta_scale=0.1):
+    def __init__(self, state_dim, seq_len, hidden_dim=64, alpha_scale=0.1, beta_scale=0.1):
         super(SelectionActor, self).__init__()
+        self.seq_len = seq_len
         self.alpha_scale = alpha_scale
         self.beta_scale = beta_scale
 
@@ -59,17 +60,23 @@ class SelectionActor(nn.Module):
             nn.GELU()
         )
 
+        # alpha remains lightweight global scaling per variable
         self.alpha_head = nn.Linear(hidden_dim, 1)
-        self.beta_head = nn.Linear(hidden_dim, 1)
+
+        # beta becomes time-aware additive calibration over temporal logits
+        self.beta_head = nn.Linear(hidden_dim, seq_len)
 
     def forward(self, state):
         """
         state: [B, N, state_dim]
+        returns:
+            alpha: [B, N, 1]
+            beta:  [B, N, L]
         """
         h = self.backbone(state)
 
         alpha_raw = self.alpha_head(h)  # [B, N, 1]
-        beta_raw = self.beta_head(h)    # [B, N, 1]
+        beta_raw = self.beta_head(h)    # [B, N, L]
 
         # Stable bounded actions:
         # alpha around 1, beta around 0
@@ -115,7 +122,7 @@ class DynamicSelectionController(nn.Module):
             -> actor(alpha, beta)
             -> critic(value)
             -> calibrated_logits zhat = alpha * z + beta
-            -> dynamic_weights = softmax(zhat)
+            -> dynamic_weights = softmax(zhat / temperature)
             -> selected_x_dynamic
 
     Inputs:
@@ -128,7 +135,7 @@ class DynamicSelectionController(nn.Module):
         dict with:
             state:             [B, N, state_dim]
             alpha:             [B, N, 1]
-            beta:              [B, N, 1]
+            beta:              [B, N, L]
             value:             [B, N, 1]
             calibrated_logits: [B, N, L]
             dynamic_weights:   [B, N, L]
@@ -142,16 +149,21 @@ class DynamicSelectionController(nn.Module):
         critic_hidden_dim=64,
         alpha_scale=0.1,
         beta_scale=0.1,
-        eps=1e-8
+        eps=1e-8,
+        temperature=1.0,
+        residual_scale=0.5
     ):
         super(DynamicSelectionController, self).__init__()
         self.seq_len = seq_len
         self.eps = eps
+        self.temperature = temperature
+        self.residual_scale = residual_scale
 
         self.state_builder = SelectionStateBuilder(eps=eps)
 
         self.actor = SelectionActor(
             state_dim=self.state_builder.state_dim,
+            seq_len=seq_len,
             hidden_dim=actor_hidden_dim,
             alpha_scale=alpha_scale,
             beta_scale=beta_scale
@@ -166,7 +178,7 @@ class DynamicSelectionController(nn.Module):
         """
         base_logits: [B, N, L]
         alpha:       [B, N, 1]
-        beta:        [B, N, 1]
+        beta:        [B, N, L]
         """
         calibrated_logits = alpha * base_logits + beta
         return calibrated_logits
@@ -184,15 +196,22 @@ class DynamicSelectionController(nn.Module):
         """
         state = self.state_builder(base_logits, base_weights, agg_repr)  # [B, N, 4]
 
-        alpha, beta = self.actor(state)          # [B, N, 1], [B, N, 1]
+        alpha, beta = self.actor(state)          # [B, N, 1], [B, N, L]
         value = self.critic(state)               # [B, N, 1]
 
         calibrated_logits = self.calibrate_logits(base_logits, alpha, beta)  # [B, N, L]
-        dynamic_weights = torch.softmax(calibrated_logits, dim=-1)           # [B, N, L]
+
+        # Keep dynamic branch semantically aligned with static selector:
+        # same temperature-scaled softmax over temporal dimension.
+        dynamic_weights = torch.softmax(calibrated_logits / self.temperature, dim=-1)  # [B, N, L]
 
         # x: [B, L, N] -> [B, N, L]
         x_var = x.permute(0, 2, 1)
-        selected_x_var = dynamic_weights * x_var
+
+        # Keep selected_x construction semantically consistent with static selector:
+        # residual modulation instead of direct probability masking.
+        modulation = 1.0 + self.residual_scale * dynamic_weights
+        selected_x_var = x_var * modulation
         selected_x = selected_x_var.permute(0, 2, 1)  # [B, L, N]
 
         return {
