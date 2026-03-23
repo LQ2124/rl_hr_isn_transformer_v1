@@ -5,8 +5,7 @@ import torch.nn.functional as F
 
 class TimeDistributed(nn.Module):
     """
-    Takes any module and stacks the time dimension with the batch dimension
-    before applying the module.
+    Apply a module on the last dimension while merging preceding dims if needed.
     """
     def __init__(self, module, batch_first=False):
         super(TimeDistributed, self).__init__()
@@ -38,22 +37,15 @@ class GLU(nn.Module):
         self.act = nn.Hardswish()
 
     def forward(self, x):
-        sig = self.act(self.fc1(x))
-        x = self.fc2(x)
-        return torch.mul(sig, x)
+        gate = self.act(self.fc1(x))
+        value = self.fc2(x)
+        return gate * value
 
 
 class GatedResidualNetwork(nn.Module):
     """
-    GRN aligned with your provided code:
-        primary input
-        -> dense
-        -> ELU
-        -> dense
-        -> dropout
-        -> gate / GLU
-        -> residual connection
-        -> add & norm
+    Lightweight GRN:
+        x -> fc1 -> ELU -> fc2 -> dropout -> GLU -> residual -> LayerNorm
     """
     def __init__(
         self,
@@ -96,12 +88,12 @@ class GatedResidualNetwork(nn.Module):
         )
 
         self.dropout = nn.Dropout(self.dropout_rate)
-        self.bn = TimeDistributed(
-            nn.LayerNorm(self.output_size),
-            batch_first=batch_first
-        )
         self.gate = TimeDistributed(
             GLU(self.output_size),
+            batch_first=batch_first
+        )
+        self.norm = TimeDistributed(
+            nn.LayerNorm(self.output_size),
             batch_first=batch_first
         )
 
@@ -111,167 +103,70 @@ class GatedResidualNetwork(nn.Module):
         else:
             residual = x
 
-        x = self.fc1(x)
+        out = self.fc1(x)
         if context is not None:
             context = self.context(context)
-            x = x + context
-        x = self.elu1(x)
+            out = out + context
 
-        x = self.fc2(x)
-        x = self.dropout(x)
-        x = self.gate(x)
-        x = x + residual
-        x = self.bn(x)
+        out = self.elu1(out)
+        out = self.fc2(out)
+        out = self.dropout(out)
+        out = self.gate(out)
+        out = out + residual
+        out = self.norm(out)
+        return out
 
-        return x
 
-
-class MyNet(nn.Module):
+class LightweightTemporalScoring(nn.Module):
     """
-    Input transformation module aligned with your provided code.
-
-    Original code fixes seq_len=96 and internal expanded feature size=16*num_inputs.
-    Here seq_len is parameterized for compatibility with the current project.
-    """
-    def __init__(self, num_inputs, seq_len, expanded_per_var=16):
-        super(MyNet, self).__init__()
-        self.num_inputs = num_inputs
-        self.seq_len = seq_len
-        self.expanded_per_var = expanded_per_var
-
-        self.fc = nn.Linear(
-            self.seq_len * self.num_inputs,
-            self.seq_len * self.expanded_per_var * self.num_inputs
-        )
-        self.act = nn.ReLU()
-
-    def forward(self, x):
-        """
-        x: [B, L, N]
-        return: [B, L, expanded_per_var * N]
-        """
-        x = x.contiguous().view(x.size(0), -1)
-        x = self.fc(x)
-        x = self.act(x)
-        x = x.contiguous().view(
-            x.size(0),
-            self.seq_len,
-            self.expanded_per_var * self.num_inputs
-        )
-        return x
-
-
-class VariableSelectionNetwork(nn.Module):
-    """
-    Paper-aligned selection structure adapted to preserve input/output shape.
+    Lightweight temporal scoring network.
 
     Input:
-        embedding: [B, L, N]
+        x_var: [B, N, L]
 
-    Internal:
-        1) MyNet transforms input to [B, L, input_size * N]
-        2) flattened_grn generates temporal selection scores over variables at each time step
-        3) each variable branch uses its own GRN
-        4) each variable branch is projected back to a scalar channel
-        5) output shape is preserved as [B, L, N]
+    Output:
+        logits: [B, N, L]
+
+    Idea:
+        For each variable, score its entire history over time using a light GRN/MLP.
+        No heavy input reconstruction.
     """
-    def __init__(self, input_size, num_inputs, hidden_size, dropout, context=None, seq_len=96):
-        super(VariableSelectionNetwork, self).__init__()
-
-        self.hidden_size = hidden_size
-        self.input_size = input_size
-        self.num_inputs = num_inputs
-        self.dropout = dropout
-        self.context = context
+    def __init__(self, seq_len, hidden_dim=64, dropout=0.1):
+        super(LightweightTemporalScoring, self).__init__()
         self.seq_len = seq_len
+        self.hidden_dim = hidden_dim
+        self.dropout = dropout
 
-        self.sparse_weights = torch.tensor(0.0)
-        self.net = MyNet(
-            num_inputs=self.num_inputs,
-            seq_len=self.seq_len,
-            expanded_per_var=self.input_size
+        self.temporal_grn = GatedResidualNetwork(
+            input_size=seq_len,
+            hidden_state_size=hidden_dim,
+            output_size=seq_len,
+            dropout=dropout,
+            batch_first=True
         )
 
-        if self.context is not None:
-            self.flattened_grn = GatedResidualNetwork(
-                self.num_inputs * self.input_size,
-                self.hidden_size,
-                self.num_inputs,
-                self.dropout,
-                self.context,
-                batch_first=True
-            )
-        else:
-            self.flattened_grn = GatedResidualNetwork(
-                self.num_inputs * self.input_size,
-                self.hidden_size,
-                self.num_inputs,
-                self.dropout,
-                batch_first=True
-            )
+        self.out_proj = TimeDistributed(
+            nn.Linear(seq_len, seq_len),
+            batch_first=True
+        )
 
-        self.single_variable_grns = nn.ModuleList()
-        self.single_variable_outs = nn.ModuleList()
-
-        for _ in range(self.num_inputs):
-            self.single_variable_grns.append(
-                GatedResidualNetwork(
-                    self.input_size,
-                    self.hidden_size,
-                    self.hidden_size,
-                    self.dropout,
-                    batch_first=True
-                )
-            )
-            self.single_variable_outs.append(
-                TimeDistributed(
-                    nn.Linear(self.hidden_size, 1),
-                    batch_first=True
-                )
-            )
-
-    def forward(self, embedding, context=None):
+    def forward(self, x_var):
         """
-        embedding: [B, L, N]
-
-        Returns:
-            outputs: [B, L, N]
-            sparse_weights: [B, L, N]
-            sparse_logits: [B, L, N]
+        x_var: [B, N, L]
         """
-        # transformed inputs: [B, L, input_size * N]
-        embedding = self.net(embedding)
-
-        # selection logits branch
-        if context is not None:
-            sparse_logits = self.flattened_grn(embedding, context)   # [B, L, N]
-        else:
-            sparse_logits = self.flattened_grn(embedding)            # [B, L, N]
-
-        sparse_weights = F.softmax(sparse_logits, dim=1)             # [B, L, N]
-
-        # per-variable GRN branch
-        var_outputs = []
-        for i in range(self.num_inputs):
-            var_slice = embedding[:, :, (i * self.input_size): (i + 1) * self.input_size]   # [B, L, input_size]
-            var_hidden = self.single_variable_grns[i](var_slice)                              # [B, L, hidden_size]
-            var_scalar = self.single_variable_outs[i](var_hidden)                             # [B, L, 1]
-            var_outputs.append(var_scalar)
-
-        # [B, L, N]
-        var_outputs = torch.cat(var_outputs, dim=2)
-
-        # preserve shape: [B, L, N]
-        outputs = var_outputs * sparse_weights
-
-        return outputs, sparse_weights, sparse_logits
+        h = self.temporal_grn(x_var)   # [B, N, L]
+        logits = self.out_proj(h)      # [B, N, L]
+        return logits
 
 
 class TemporalInputSelection(nn.Module):
     """
-    Compatibility wrapper for the current project.
+    Simplified temporal input selection for iTransformer compatibility.
 
-    Required current project output:
+    Input:
+        x: [B, L, N]
+
+    Output dict:
         {
             'selected_x': [B, L, N],
             'logits':     [B, N, L],
@@ -279,6 +174,11 @@ class TemporalInputSelection(nn.Module):
             'agg_repr':   [B, N],
             'sparse_loss': scalar
         }
+
+    Key changes vs old version:
+        1) Remove heavy MyNet reconstruction.
+        2) Directly generate temporal logits from raw input.
+        3) selected_x is residual modulation of original x, not reconstructed x.
     """
 
     def __init__(
@@ -288,7 +188,8 @@ class TemporalInputSelection(nn.Module):
         dropout=0.1,
         temperature=1.0,
         sparse_type='entropy',
-        eps=1e-8
+        eps=1e-8,
+        residual_scale=0.5
     ):
         super(TemporalInputSelection, self).__init__()
         self.seq_len = seq_len
@@ -297,49 +198,24 @@ class TemporalInputSelection(nn.Module):
         self.temperature = temperature
         self.sparse_type = sparse_type
         self.eps = eps
+        self.residual_scale = residual_scale
 
-        # aligned with provided code: internal per-variable expanded size
-        self.input_size = 16
-
-        # lazy build because num_inputs = N is only known at runtime
-        self.vsn = None
-        self.cached_num_inputs = None
-        self.cached_seq_len = None
-
-    def _build_if_needed(self, x):
-        """
-        x: [B, L, N]
-        """
-        _, seq_len, num_inputs = x.shape
-
-        need_rebuild = (
-            self.vsn is None
-            or self.cached_num_inputs != num_inputs
-            or self.cached_seq_len != seq_len
+        self.temporal_scorer = LightweightTemporalScoring(
+            seq_len=seq_len,
+            hidden_dim=hidden_dim,
+            dropout=dropout
         )
 
-        if need_rebuild:
-            self.vsn = VariableSelectionNetwork(
-                input_size=self.input_size,
-                num_inputs=num_inputs,
-                hidden_size=self.hidden_dim,
-                dropout=self.dropout,
-                context=None,
-                seq_len=seq_len
-            ).to(x.device)
-
-            self.cached_num_inputs = num_inputs
-            self.cached_seq_len = seq_len
-
-    def _compute_sparse_loss(self, weights_bnL):
+    def _compute_sparse_loss(self, weights_bnL, logits_bnL):
         """
         weights_bnL: [B, N, L]
+        logits_bnL:  [B, N, L]
         """
         if self.sparse_type == 'entropy':
             entropy = -(weights_bnL * torch.log(weights_bnL + self.eps)).sum(dim=-1)  # [B, N]
             sparse_loss = entropy.mean()
         elif self.sparse_type == 'logits_l1':
-            sparse_loss = torch.mean(torch.abs(weights_bnL))
+            sparse_loss = torch.mean(torch.abs(logits_bnL))
         elif self.sparse_type == 'none':
             sparse_loss = weights_bnL.new_tensor(0.0)
         else:
@@ -349,31 +225,26 @@ class TemporalInputSelection(nn.Module):
     def forward(self, x):
         """
         x: [B, L, N]
-
-        Returns:
-            {
-                'selected_x': [B, L, N],
-                'logits':     [B, N, L],
-                'weights':    [B, N, L],
-                'agg_repr':   [B, N],
-                'sparse_loss': scalar
-            }
         """
-        self._build_if_needed(x)
+        # [B, L, N] -> [B, N, L]
+        x_var = x.permute(0, 2, 1)
 
-        selected_x, sparse_weights, sparse_logits = self.vsn(x)
-        # selected_x:    [B, L, N]
-        # sparse_weights:[B, L, N]
-        # sparse_logits: [B, L, N]
+        # lightweight logits over temporal dimension
+        logits = self.temporal_scorer(x_var)  # [B, N, L]
 
-        # project to current project convention
-        weights = sparse_weights.permute(0, 2, 1)  # [B, N, L]
-        logits = sparse_logits.permute(0, 2, 1)    # [B, N, L]
+        # temperature-scaled softmax over time dimension
+        weights = torch.softmax(logits / self.temperature, dim=-1)  # [B, N, L]
 
-        # compatibility summary statistic
-        agg_repr = torch.sum(weights * x.permute(0, 2, 1), dim=-1)  # [B, N]
+        # aggregated representation for compatibility / controller state
+        agg_repr = torch.sum(weights * x_var, dim=-1)  # [B, N]
 
-        sparse_loss = self._compute_sparse_loss(weights)
+        # residual modulation on original input
+        # selected_x_var = x_var * (1 + residual_scale * weights)
+        modulation = 1.0 + self.residual_scale * weights
+        selected_x_var = x_var * modulation
+        selected_x = selected_x_var.permute(0, 2, 1)  # [B, L, N]
+
+        sparse_loss = self._compute_sparse_loss(weights, logits)
 
         return {
             'selected_x': selected_x,   # [B, L, N]
