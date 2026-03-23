@@ -31,6 +31,7 @@ class Model(nn.Module):
         selector_dropout = getattr(configs, 'selector_dropout', configs.dropout)
         selector_temperature = getattr(configs, 'selector_temperature', 1.0)
         sparse_type = getattr(configs, 'sparse_type', 'entropy')
+        residual_scale = getattr(configs, 'residual_scale', 0.5)
 
         # -------- Dynamic controller config --------
         actor_hidden_dim = getattr(configs, 'actor_hidden_dim', 64)
@@ -44,7 +45,8 @@ class Model(nn.Module):
             hidden_dim=selector_hidden_dim,
             dropout=selector_dropout,
             temperature=selector_temperature,
-            sparse_type=sparse_type
+            sparse_type=sparse_type,
+            residual_scale=residual_scale
         )
 
         # -------- Dynamic controller --------
@@ -53,7 +55,9 @@ class Model(nn.Module):
             actor_hidden_dim=actor_hidden_dim,
             critic_hidden_dim=critic_hidden_dim,
             alpha_scale=alpha_scale,
-            beta_scale=beta_scale
+            beta_scale=beta_scale,
+            temperature=selector_temperature,
+            residual_scale=residual_scale
         )
 
         # -------- iTransformer backbone --------
@@ -170,7 +174,7 @@ class Model(nn.Module):
         dynamic_selected_x = dynamic_out['selected_x']              # [B, L, N]
         state = dynamic_out['state']                                # [B, N, state_dim]
         alpha = dynamic_out['alpha']                                # [B, N, 1]
-        beta = dynamic_out['beta']                                  # [B, N, 1]
+        beta = dynamic_out['beta']                                  # [B, N, L]
         value = dynamic_out['value']                                # [B, N, 1]
         calibrated_logits = dynamic_out['calibrated_logits']        # [B, N, L]
         dynamic_weights = dynamic_out['dynamic_weights']            # [B, N, L]
@@ -184,8 +188,14 @@ class Model(nn.Module):
             self.pred_len
         )  # [B, pred_len, N]
 
-        # Optional action strength for trainer-side surrogate actor loss
-        action_strength = torch.mean(torch.abs(alpha - 1.0) + torch.abs(beta), dim=-1)  # [B, N]
+        # action_strength aligned for trainer-side surrogate actor loss
+        # alpha contributes as global scaling strength: [B, N]
+        alpha_strength = torch.abs(alpha - 1.0).squeeze(-1)  # [B, N]
+
+        # beta contributes as time-aware additive calibration strength: aggregate over temporal dim -> [B, N]
+        beta_strength = torch.mean(torch.abs(beta), dim=-1)  # [B, N]
+
+        action_strength = alpha_strength + beta_strength      # [B, N]
 
         aux = {
             # static selection outputs
@@ -231,6 +241,10 @@ class Model(nn.Module):
         dynamic_selected_x = dynamic_out['selected_x']
         pred = self._backbone_predict(dynamic_selected_x, x_mark_enc, means, stdev, L)
 
+        alpha_strength = torch.abs(dynamic_out['alpha'] - 1.0).squeeze(-1)  # [B, N]
+        beta_strength = torch.mean(torch.abs(dynamic_out['beta']), dim=-1)  # [B, N]
+        action_strength = alpha_strength + beta_strength
+
         aux = {
             'selection_logits': static_out['logits'],
             'selection_weights': static_out['weights'],
@@ -243,10 +257,7 @@ class Model(nn.Module):
             'calibrated_logits': dynamic_out['calibrated_logits'],
             'dynamic_weights': dynamic_out['dynamic_weights'],
             'selected_x': dynamic_selected_x,
-            'action_strength': torch.mean(
-                torch.abs(dynamic_out['alpha'] - 1.0) + torch.abs(dynamic_out['beta']),
-                dim=-1
-            ),
+            'action_strength': action_strength,
             'static_pred': pred.detach(),
             'dynamic_pred': pred
         }
@@ -267,6 +278,10 @@ class Model(nn.Module):
         dynamic_selected_x = dynamic_out['selected_x']
         pred = self._backbone_predict(dynamic_selected_x, None, means, stdev, L)
 
+        alpha_strength = torch.abs(dynamic_out['alpha'] - 1.0).squeeze(-1)  # [B, N]
+        beta_strength = torch.mean(torch.abs(dynamic_out['beta']), dim=-1)  # [B, N]
+        action_strength = alpha_strength + beta_strength
+
         aux = {
             'selection_logits': static_out['logits'],
             'selection_weights': static_out['weights'],
@@ -279,10 +294,7 @@ class Model(nn.Module):
             'calibrated_logits': dynamic_out['calibrated_logits'],
             'dynamic_weights': dynamic_out['dynamic_weights'],
             'selected_x': dynamic_selected_x,
-            'action_strength': torch.mean(
-                torch.abs(dynamic_out['alpha'] - 1.0) + torch.abs(dynamic_out['beta']),
-                dim=-1
-            ),
+            'action_strength': action_strength,
             'static_pred': pred.detach(),
             'dynamic_pred': pred
         }
@@ -306,6 +318,10 @@ class Model(nn.Module):
         output = output.reshape(output.shape[0], -1)
         output = self.projection(output)
 
+        alpha_strength = torch.abs(dynamic_out['alpha'] - 1.0).squeeze(-1)  # [B, N]
+        beta_strength = torch.mean(torch.abs(dynamic_out['beta']), dim=-1)  # [B, N]
+        action_strength = alpha_strength + beta_strength
+
         aux = {
             'selection_logits': static_out['logits'],
             'selection_weights': static_out['weights'],
@@ -318,10 +334,7 @@ class Model(nn.Module):
             'calibrated_logits': dynamic_out['calibrated_logits'],
             'dynamic_weights': dynamic_out['dynamic_weights'],
             'selected_x': dynamic_selected_x,
-            'action_strength': torch.mean(
-                torch.abs(dynamic_out['alpha'] - 1.0) + torch.abs(dynamic_out['beta']),
-                dim=-1
-            ),
+            'action_strength': action_strength,
             'static_pred': output.detach(),
             'dynamic_pred': output
         }
