@@ -117,9 +117,112 @@ class GatedResidualNetwork(nn.Module):
         return out
 
 
-class LightweightTemporalScoring(nn.Module):
+class LocalSmoothingBranch(nn.Module):
     """
-    Lightweight temporal scoring network.
+    Local-smoothed temporal branch.
+
+    Input:
+        x_var: [B, N, L]
+
+    Output:
+        h_local: [B, N, L]
+
+    Idea:
+        Use depthwise 1D conv along temporal dimension to capture local smoothed patterns,
+        then refine with a lightweight GRN.
+    """
+    def __init__(self, seq_len, hidden_dim=64, dropout=0.1, kernel_size=5):
+        super(LocalSmoothingBranch, self).__init__()
+        self.seq_len = seq_len
+        self.hidden_dim = hidden_dim
+        self.kernel_size = kernel_size
+
+        padding = kernel_size // 2
+
+        # depthwise conv over time for each variable independently
+        self.local_conv = nn.Conv1d(
+            in_channels=1,
+            out_channels=1,
+            kernel_size=kernel_size,
+            padding=padding,
+            groups=1,
+            bias=True
+        )
+
+        self.local_grn = GatedResidualNetwork(
+            input_size=seq_len,
+            hidden_state_size=hidden_dim,
+            output_size=seq_len,
+            dropout=dropout,
+            batch_first=True
+        )
+
+    def forward(self, x_var):
+        """
+        x_var: [B, N, L]
+        """
+        B, N, L = x_var.shape
+        x_reshape = x_var.contiguous().view(B * N, 1, L)   # [B*N, 1, L]
+        x_local = self.local_conv(x_reshape)               # [B*N, 1, L]
+        x_local = x_local.view(B, N, L)                    # [B, N, L]
+        h_local = self.local_grn(x_local)                  # [B, N, L]
+        return h_local
+
+
+class CoarseScaleBranch(nn.Module):
+    """
+    Coarse-scale temporal branch.
+
+    Input:
+        x_var: [B, N, L]
+
+    Output:
+        h_coarse: [B, N, L]
+
+    Idea:
+        Build a coarse temporal representation by downsampling over time,
+        then up-project back to length L and refine by GRN.
+    """
+    def __init__(self, seq_len, hidden_dim=64, dropout=0.1, coarse_ratio=4):
+        super(CoarseScaleBranch, self).__init__()
+        self.seq_len = seq_len
+        self.hidden_dim = hidden_dim
+        self.dropout = dropout
+        self.coarse_ratio = max(1, coarse_ratio)
+
+        coarse_len = max(1, seq_len // self.coarse_ratio)
+        self.coarse_len = coarse_len
+
+        self.pool = nn.AdaptiveAvgPool1d(coarse_len)
+        self.up_proj = TimeDistributed(
+            nn.Linear(coarse_len, seq_len),
+            batch_first=True
+        )
+
+        self.coarse_grn = GatedResidualNetwork(
+            input_size=seq_len,
+            hidden_state_size=hidden_dim,
+            output_size=seq_len,
+            dropout=dropout,
+            batch_first=True
+        )
+
+    def forward(self, x_var):
+        """
+        x_var: [B, N, L]
+        """
+        B, N, L = x_var.shape
+        x_reshape = x_var.contiguous().view(B * N, 1, L)   # [B*N, 1, L]
+        x_coarse = self.pool(x_reshape).squeeze(1)         # [B*N, coarse_len]
+        x_coarse = x_coarse.view(B, N, self.coarse_len)    # [B, N, coarse_len]
+        x_up = self.up_proj(x_coarse)                      # [B, N, L]
+        h_coarse = self.coarse_grn(x_up)                   # [B, N, L]
+        return h_coarse
+
+
+class MultiScaleTemporalScoring(nn.Module):
+    """
+    Multi-scale temporal scoring network.
 
     Input:
         x_var: [B, N, L]
@@ -127,17 +230,63 @@ class LightweightTemporalScoring(nn.Module):
     Output:
         logits: [B, N, L]
 
-    Idea:
-        For each variable, score its entire history over time using a light GRN/MLP.
-        No heavy input reconstruction.
+    Branches:
+        1) raw-scale branch
+        2) local-smoothed branch
+        3) coarse-scale branch
+
+    Fusion:
+        Per-variable scale gating over branch representations.
     """
-    def __init__(self, seq_len, hidden_dim=64, dropout=0.1):
-        super(LightweightTemporalScoring, self).__init__()
+    def __init__(
+        self,
+        seq_len,
+        hidden_dim=64,
+        dropout=0.1,
+        local_kernel_size=5,
+        coarse_ratio=4
+    ):
+        super(MultiScaleTemporalScoring, self).__init__()
         self.seq_len = seq_len
         self.hidden_dim = hidden_dim
         self.dropout = dropout
 
-        self.temporal_grn = GatedResidualNetwork(
+        # raw branch
+        self.raw_grn = GatedResidualNetwork(
+            input_size=seq_len,
+            hidden_state_size=hidden_dim,
+            output_size=seq_len,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # local branch
+        self.local_branch = LocalSmoothingBranch(
+            seq_len=seq_len,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            kernel_size=local_kernel_size
+        )
+
+        # coarse branch
+        self.coarse_branch = CoarseScaleBranch(
+            seq_len=seq_len,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            coarse_ratio=coarse_ratio
+        )
+
+        # branch-wise scale gate
+        # Use global summary over time for each branch representation:
+        # [B,N,L] -> [B,N,1], then concat 3 branches -> [B,N,3]
+        self.scale_gate = nn.Sequential(
+            nn.Linear(3, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 3)
+        )
+
+        # final fusion refinement + output projection
+        self.fusion_grn = GatedResidualNetwork(
             input_size=seq_len,
             hidden_state_size=hidden_dim,
             output_size=seq_len,
@@ -154,14 +303,36 @@ class LightweightTemporalScoring(nn.Module):
         """
         x_var: [B, N, L]
         """
-        h = self.temporal_grn(x_var)   # [B, N, L]
-        logits = self.out_proj(h)      # [B, N, L]
+        # multi-scale branch features
+        h_raw = self.raw_grn(x_var)              # [B, N, L]
+        h_local = self.local_branch(x_var)       # [B, N, L]
+        h_coarse = self.coarse_branch(x_var)     # [B, N, L]
+
+        # summaries for scale gating
+        s_raw = h_raw.mean(dim=-1, keepdim=True)        # [B, N, 1]
+        s_local = h_local.mean(dim=-1, keepdim=True)    # [B, N, 1]
+        s_coarse = h_coarse.mean(dim=-1, keepdim=True)  # [B, N, 1]
+
+        scale_summary = torch.cat([s_raw, s_local, s_coarse], dim=-1)  # [B, N, 3]
+        scale_logits = self.scale_gate(scale_summary)                   # [B, N, 3]
+        scale_weights = torch.softmax(scale_logits, dim=-1)             # [B, N, 3]
+
+        w_raw = scale_weights[..., 0].unsqueeze(-1)     # [B, N, 1]
+        w_local = scale_weights[..., 1].unsqueeze(-1)   # [B, N, 1]
+        w_coarse = scale_weights[..., 2].unsqueeze(-1)  # [B, N, 1]
+
+        # gated fusion
+        h_fused = w_raw * h_raw + w_local * h_local + w_coarse * h_coarse  # [B, N, L]
+
+        # fusion refinement + final logits
+        h_fused = self.fusion_grn(h_fused)      # [B, N, L]
+        logits = self.out_proj(h_fused)         # [B, N, L]
         return logits
 
 
 class TemporalInputSelection(nn.Module):
     """
-    Simplified temporal input selection for iTransformer compatibility.
+    Multi-scale temporal input selection for iTransformer compatibility.
 
     Input:
         x: [B, L, N]
@@ -175,10 +346,13 @@ class TemporalInputSelection(nn.Module):
             'sparse_loss': scalar
         }
 
-    Key changes vs old version:
-        1) Remove heavy MyNet reconstruction.
-        2) Directly generate temporal logits from raw input.
-        3) selected_x is residual modulation of original x, not reconstructed x.
+    Key design:
+        1) Multi-scale temporal scoring:
+            - raw scale
+            - local smoothed scale
+            - coarse scale
+        2) Final selected_x uses residual modulation for stable integration
+           with iTransformer backbone.
     """
 
     def __init__(
@@ -189,7 +363,9 @@ class TemporalInputSelection(nn.Module):
         temperature=1.0,
         sparse_type='entropy',
         eps=1e-8,
-        residual_scale=0.5
+        residual_scale=0.5,
+        local_kernel_size=5,
+        coarse_ratio=4
     ):
         super(TemporalInputSelection, self).__init__()
         self.seq_len = seq_len
@@ -200,10 +376,12 @@ class TemporalInputSelection(nn.Module):
         self.eps = eps
         self.residual_scale = residual_scale
 
-        self.temporal_scorer = LightweightTemporalScoring(
+        self.temporal_scorer = MultiScaleTemporalScoring(
             seq_len=seq_len,
             hidden_dim=hidden_dim,
-            dropout=dropout
+            dropout=dropout,
+            local_kernel_size=local_kernel_size,
+            coarse_ratio=coarse_ratio
         )
 
     def _compute_sparse_loss(self, weights_bnL, logits_bnL):
@@ -229,7 +407,7 @@ class TemporalInputSelection(nn.Module):
         # [B, L, N] -> [B, N, L]
         x_var = x.permute(0, 2, 1)
 
-        # lightweight logits over temporal dimension
+        # multi-scale logits over temporal dimension
         logits = self.temporal_scorer(x_var)  # [B, N, L]
 
         # temperature-scaled softmax over time dimension
@@ -239,7 +417,6 @@ class TemporalInputSelection(nn.Module):
         agg_repr = torch.sum(weights * x_var, dim=-1)  # [B, N]
 
         # residual modulation on original input
-        # selected_x_var = x_var * (1 + residual_scale * weights)
         modulation = 1.0 + self.residual_scale * weights
         selected_x_var = x_var * modulation
         selected_x = selected_x_var.permute(0, 2, 1)  # [B, L, N]
