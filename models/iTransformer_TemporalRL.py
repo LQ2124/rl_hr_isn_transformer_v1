@@ -12,12 +12,10 @@ from layers.dynamic_selection_rl import DynamicSelectionController
 class Model(nn.Module):
     """
     Dynamic temporal selection + lightweight actor-critic + iTransformer backbone
-    (research-oriented version).
 
-    Key principle:
-        The model only performs forward computation and returns RL-related
-        intermediate quantities. Reward / advantage / actor_loss / critic_loss
-        should be computed in the trainer using real forecasting targets.
+    Upgraded design:
+        RL controls target-aware multi-scale scale preference,
+        instead of weak point-wise affine logit perturbation.
     """
 
     def __init__(self, configs):
@@ -33,11 +31,13 @@ class Model(nn.Module):
         sparse_type = getattr(configs, 'sparse_type', 'entropy')
         residual_scale = getattr(configs, 'residual_scale', 0.5)
 
+        local_kernel_size = getattr(configs, 'local_kernel_size', 5)
+        coarse_ratio = getattr(configs, 'coarse_ratio', 4)
+
         # -------- Dynamic controller config --------
         actor_hidden_dim = getattr(configs, 'actor_hidden_dim', 64)
         critic_hidden_dim = getattr(configs, 'critic_hidden_dim', 64)
-        alpha_scale = getattr(configs, 'alpha_scale', 0.1)
-        beta_scale = getattr(configs, 'beta_scale', 0.1)
+        action_scale = getattr(configs, 'action_scale', 0.5)
 
         # -------- Static temporal selector --------
         self.temporal_selector = TemporalInputSelection(
@@ -46,16 +46,17 @@ class Model(nn.Module):
             dropout=selector_dropout,
             temperature=selector_temperature,
             sparse_type=sparse_type,
-            residual_scale=residual_scale
+            residual_scale=residual_scale,
+            local_kernel_size=local_kernel_size,
+            coarse_ratio=coarse_ratio
         )
 
-        # -------- Dynamic controller --------
+        # -------- Dynamic RL controller --------
         self.dynamic_controller = DynamicSelectionController(
             seq_len=configs.seq_len,
             actor_hidden_dim=actor_hidden_dim,
             critic_hidden_dim=critic_hidden_dim,
-            alpha_scale=alpha_scale,
-            beta_scale=beta_scale,
+            action_scale=action_scale,
             temperature=selector_temperature,
             residual_scale=residual_scale
         )
@@ -146,13 +147,18 @@ class Model(nn.Module):
         # -------- Normalize input --------
         x_norm, means, stdev = self._normalize(x_enc)
 
-        # -------- Static selector --------
+        # -------- Static multi-scale selector --------
         static_out = self.temporal_selector(x_norm)
-        static_selected_x = static_out['selected_x']   # [B, L, N]
-        base_logits = static_out['logits']             # [B, N, L]
-        base_weights = static_out['weights']           # [B, N, L]
-        agg_repr = static_out['agg_repr']              # [B, N]
+
+        static_selected_x = static_out['selected_x']          # [B, L, N]
+        base_logits = static_out['logits']                    # [B, N, L]
+        base_weights = static_out['weights']                  # [B, N, L]
+        agg_repr = static_out['agg_repr']                     # [B, N]
         sparse_loss = static_out['sparse_loss']
+
+        branch_logits = static_out['branch_logits']           # dict of [B, N, L]
+        static_scale_weights = static_out['scale_weights']    # [B, N, 3]
+        summaries = static_out['summaries']                   # dict of [B, N]
 
         # -------- Static prediction branch --------
         static_pred = self._backbone_predict(
@@ -163,21 +169,28 @@ class Model(nn.Module):
             self.pred_len
         )  # [B, pred_len, N]
 
-        # -------- Dynamic controller --------
+        # -------- Dynamic RL controller --------
         dynamic_out = self.dynamic_controller(
             x=x_norm,
-            base_logits=base_logits,
+            branch_logits=branch_logits,
             base_weights=base_weights,
-            agg_repr=agg_repr
+            agg_repr=agg_repr,
+            static_scale_weights=static_scale_weights,
+            summaries=summaries
         )
 
-        dynamic_selected_x = dynamic_out['selected_x']              # [B, L, N]
-        state = dynamic_out['state']                                # [B, N, state_dim]
-        alpha = dynamic_out['alpha']                                # [B, N, 1]
-        beta = dynamic_out['beta']                                  # [B, N, L]
-        value = dynamic_out['value']                                # [B, N, 1]
-        calibrated_logits = dynamic_out['calibrated_logits']        # [B, N, L]
-        dynamic_weights = dynamic_out['dynamic_weights']            # [B, N, L]
+        dynamic_selected_x = dynamic_out['selected_x']                # [B, L, N]
+        state = dynamic_out['state']                                  # [B, N, state_dim]
+        value = dynamic_out['value']                                  # [B, N, 1]
+
+        action_delta = dynamic_out['action_delta']                    # [B, N, 3]
+        action_strength = dynamic_out['action_strength']              # [B, N]
+
+        dynamic_scale_logits = dynamic_out['dynamic_scale_logits']    # [B, N, 3]
+        dynamic_scale_weights = dynamic_out['dynamic_scale_weights']  # [B, N, 3]
+
+        calibrated_logits = dynamic_out['calibrated_logits']          # [B, N, L]
+        dynamic_weights = dynamic_out['dynamic_weights']              # [B, N, L]
 
         # -------- Dynamic prediction branch --------
         dynamic_pred = self._backbone_predict(
@@ -188,34 +201,31 @@ class Model(nn.Module):
             self.pred_len
         )  # [B, pred_len, N]
 
-        # action_strength aligned for trainer-side surrogate actor loss
-        # alpha contributes as global scaling strength: [B, N]
-        alpha_strength = torch.abs(alpha - 1.0).squeeze(-1)  # [B, N]
-
-        # beta contributes as time-aware additive calibration strength: aggregate over temporal dim -> [B, N]
-        beta_strength = torch.mean(torch.abs(beta), dim=-1)  # [B, N]
-
-        action_strength = alpha_strength + beta_strength      # [B, N]
-
         aux = {
-            # static selection outputs
+            # static outputs
             'selection_logits': base_logits,
             'selection_weights': base_weights,
             'agg_repr': agg_repr,
             'sparse_loss': sparse_loss,
             'static_selected_x': static_selected_x,
 
-            # dynamic controller outputs
+            # static multi-scale info
+            'branch_logits': branch_logits,
+            'static_scale_weights': static_scale_weights,
+            'summaries': summaries,
+
+            # dynamic RL outputs
             'state': state,
-            'alpha': alpha,
-            'beta': beta,
             'value': value,
+            'action_delta': action_delta,
+            'action_strength': action_strength,
+            'dynamic_scale_logits': dynamic_scale_logits,
+            'dynamic_scale_weights': dynamic_scale_weights,
             'calibrated_logits': calibrated_logits,
             'dynamic_weights': dynamic_weights,
             'selected_x': dynamic_selected_x,
-            'action_strength': action_strength,
 
-            # explicit static-vs-dynamic predictions for trainer-side reward computation
+            # explicit predictions for trainer-side reward
             'static_pred': static_pred,
             'dynamic_pred': dynamic_pred
         }
@@ -223,41 +233,42 @@ class Model(nn.Module):
         return dynamic_pred, aux
 
     def imputation(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask):
-        """
-        Compatibility path.
-        RL-specific losses are not intended for this task in the current project.
-        """
         x_norm, means, stdev = self._normalize(x_enc)
         _, L, N = x_norm.shape
 
         static_out = self.temporal_selector(x_norm)
+
         dynamic_out = self.dynamic_controller(
             x=x_norm,
-            base_logits=static_out['logits'],
+            branch_logits=static_out['branch_logits'],
             base_weights=static_out['weights'],
-            agg_repr=static_out['agg_repr']
+            agg_repr=static_out['agg_repr'],
+            static_scale_weights=static_out['scale_weights'],
+            summaries=static_out['summaries']
         )
 
         dynamic_selected_x = dynamic_out['selected_x']
         pred = self._backbone_predict(dynamic_selected_x, x_mark_enc, means, stdev, L)
-
-        alpha_strength = torch.abs(dynamic_out['alpha'] - 1.0).squeeze(-1)  # [B, N]
-        beta_strength = torch.mean(torch.abs(dynamic_out['beta']), dim=-1)  # [B, N]
-        action_strength = alpha_strength + beta_strength
 
         aux = {
             'selection_logits': static_out['logits'],
             'selection_weights': static_out['weights'],
             'agg_repr': static_out['agg_repr'],
             'sparse_loss': static_out['sparse_loss'],
+            'branch_logits': static_out['branch_logits'],
+            'static_scale_weights': static_out['scale_weights'],
+            'summaries': static_out['summaries'],
+
             'state': dynamic_out['state'],
-            'alpha': dynamic_out['alpha'],
-            'beta': dynamic_out['beta'],
             'value': dynamic_out['value'],
+            'action_delta': dynamic_out['action_delta'],
+            'action_strength': dynamic_out['action_strength'],
+            'dynamic_scale_logits': dynamic_out['dynamic_scale_logits'],
+            'dynamic_scale_weights': dynamic_out['dynamic_scale_weights'],
             'calibrated_logits': dynamic_out['calibrated_logits'],
             'dynamic_weights': dynamic_out['dynamic_weights'],
             'selected_x': dynamic_selected_x,
-            'action_strength': action_strength,
+
             'static_pred': pred.detach(),
             'dynamic_pred': pred
         }
@@ -268,33 +279,38 @@ class Model(nn.Module):
         _, L, N = x_norm.shape
 
         static_out = self.temporal_selector(x_norm)
+
         dynamic_out = self.dynamic_controller(
             x=x_norm,
-            base_logits=static_out['logits'],
+            branch_logits=static_out['branch_logits'],
             base_weights=static_out['weights'],
-            agg_repr=static_out['agg_repr']
+            agg_repr=static_out['agg_repr'],
+            static_scale_weights=static_out['scale_weights'],
+            summaries=static_out['summaries']
         )
 
         dynamic_selected_x = dynamic_out['selected_x']
         pred = self._backbone_predict(dynamic_selected_x, None, means, stdev, L)
-
-        alpha_strength = torch.abs(dynamic_out['alpha'] - 1.0).squeeze(-1)  # [B, N]
-        beta_strength = torch.mean(torch.abs(dynamic_out['beta']), dim=-1)  # [B, N]
-        action_strength = alpha_strength + beta_strength
 
         aux = {
             'selection_logits': static_out['logits'],
             'selection_weights': static_out['weights'],
             'agg_repr': static_out['agg_repr'],
             'sparse_loss': static_out['sparse_loss'],
+            'branch_logits': static_out['branch_logits'],
+            'static_scale_weights': static_out['scale_weights'],
+            'summaries': static_out['summaries'],
+
             'state': dynamic_out['state'],
-            'alpha': dynamic_out['alpha'],
-            'beta': dynamic_out['beta'],
             'value': dynamic_out['value'],
+            'action_delta': dynamic_out['action_delta'],
+            'action_strength': dynamic_out['action_strength'],
+            'dynamic_scale_logits': dynamic_out['dynamic_scale_logits'],
+            'dynamic_scale_weights': dynamic_out['dynamic_scale_weights'],
             'calibrated_logits': dynamic_out['calibrated_logits'],
             'dynamic_weights': dynamic_out['dynamic_weights'],
             'selected_x': dynamic_selected_x,
-            'action_strength': action_strength,
+
             'static_pred': pred.detach(),
             'dynamic_pred': pred
         }
@@ -302,14 +318,18 @@ class Model(nn.Module):
 
     def classification(self, x_enc, x_mark_enc):
         static_out = self.temporal_selector(x_enc)
+
         dynamic_out = self.dynamic_controller(
             x=x_enc,
-            base_logits=static_out['logits'],
+            branch_logits=static_out['branch_logits'],
             base_weights=static_out['weights'],
-            agg_repr=static_out['agg_repr']
+            agg_repr=static_out['agg_repr'],
+            static_scale_weights=static_out['scale_weights'],
+            summaries=static_out['summaries']
         )
 
         dynamic_selected_x = dynamic_out['selected_x']
+
         enc_out = self.enc_embedding(dynamic_selected_x, None)
         enc_out, attns = self.encoder(enc_out, attn_mask=None)
 
@@ -318,23 +338,25 @@ class Model(nn.Module):
         output = output.reshape(output.shape[0], -1)
         output = self.projection(output)
 
-        alpha_strength = torch.abs(dynamic_out['alpha'] - 1.0).squeeze(-1)  # [B, N]
-        beta_strength = torch.mean(torch.abs(dynamic_out['beta']), dim=-1)  # [B, N]
-        action_strength = alpha_strength + beta_strength
-
         aux = {
             'selection_logits': static_out['logits'],
             'selection_weights': static_out['weights'],
             'agg_repr': static_out['agg_repr'],
             'sparse_loss': static_out['sparse_loss'],
+            'branch_logits': static_out['branch_logits'],
+            'static_scale_weights': static_out['scale_weights'],
+            'summaries': static_out['summaries'],
+
             'state': dynamic_out['state'],
-            'alpha': dynamic_out['alpha'],
-            'beta': dynamic_out['beta'],
             'value': dynamic_out['value'],
+            'action_delta': dynamic_out['action_delta'],
+            'action_strength': dynamic_out['action_strength'],
+            'dynamic_scale_logits': dynamic_out['dynamic_scale_logits'],
+            'dynamic_scale_weights': dynamic_out['dynamic_scale_weights'],
             'calibrated_logits': dynamic_out['calibrated_logits'],
             'dynamic_weights': dynamic_out['dynamic_weights'],
             'selected_x': dynamic_selected_x,
-            'action_strength': action_strength,
+
             'static_pred': output.detach(),
             'dynamic_pred': output
         }
