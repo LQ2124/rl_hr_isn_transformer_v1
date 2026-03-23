@@ -5,12 +5,20 @@ import torch.nn.functional as F
 
 class SelectionStateBuilder(nn.Module):
     """
-    Build lightweight per-variable state for dynamic temporal selection.
+    Build lightweight target-aware multi-scale state for dynamic temporal selection.
 
     Inputs:
-        base_logits:  [B, N, L]
-        base_weights: [B, N, L]
-        agg_repr:     [B, N]
+        branch_logits:
+            raw    [B, N, L]
+            local  [B, N, L]
+            coarse [B, N, L]
+        base_weights:        [B, N, L]
+        agg_repr:            [B, N]
+        static_scale_weights:[B, N, 3]
+        summaries:
+            raw    [B, N]
+            local  [B, N]
+            coarse [B, N]
 
     Output:
         state: [B, N, state_dim]
@@ -19,39 +27,76 @@ class SelectionStateBuilder(nn.Module):
     def __init__(self, eps=1e-8):
         super(SelectionStateBuilder, self).__init__()
         self.eps = eps
-        self.state_dim = 4  # agg_repr, logits_mean, logits_std, weights_entropy
 
-    def forward(self, base_logits, base_weights, agg_repr):
-        logits_mean = base_logits.mean(dim=-1)  # [B, N]
-        logits_std = base_logits.std(dim=-1, unbiased=False)  # [B, N]
-        weights_entropy = -(base_weights * torch.log(base_weights + self.eps)).sum(dim=-1)  # [B, N]
+        # [agg_repr,
+        #  raw_summary, local_summary, coarse_summary,
+        #  base_entropy,
+        #  raw_local_gap, raw_coarse_gap, local_coarse_gap,
+        #  static_scale_raw, static_scale_local, static_scale_coarse]
+        self.state_dim = 11
+
+    def forward(
+        self,
+        branch_logits,
+        base_weights,
+        agg_repr,
+        static_scale_weights,
+        summaries
+    ):
+        z_raw = branch_logits['raw']         # [B, N, L]
+        z_local = branch_logits['local']     # [B, N, L]
+        z_coarse = branch_logits['coarse']   # [B, N, L]
+
+        s_raw = summaries['raw']             # [B, N]
+        s_local = summaries['local']         # [B, N]
+        s_coarse = summaries['coarse']       # [B, N]
+
+        base_entropy = -(base_weights * torch.log(base_weights + self.eps)).sum(dim=-1)  # [B, N]
+
+        raw_local_gap = torch.mean(torch.abs(z_raw - z_local), dim=-1)       # [B, N]
+        raw_coarse_gap = torch.mean(torch.abs(z_raw - z_coarse), dim=-1)     # [B, N]
+        local_coarse_gap = torch.mean(torch.abs(z_local - z_coarse), dim=-1) # [B, N]
+
+        scale_raw = static_scale_weights[..., 0]      # [B, N]
+        scale_local = static_scale_weights[..., 1]    # [B, N]
+        scale_coarse = static_scale_weights[..., 2]   # [B, N]
 
         state = torch.stack(
-            [agg_repr, logits_mean, logits_std, weights_entropy],
+            [
+                agg_repr,
+                s_raw,
+                s_local,
+                s_coarse,
+                base_entropy,
+                raw_local_gap,
+                raw_coarse_gap,
+                local_coarse_gap,
+                scale_raw,
+                scale_local,
+                scale_coarse
+            ],
             dim=-1
-        )  # [B, N, 4]
+        )  # [B, N, 11]
 
         return state
 
 
-class SelectionActor(nn.Module):
+class ScalePreferenceActor(nn.Module):
     """
-    Lightweight actor:
-        state -> alpha, beta
+    Actor outputs dynamic scale preference actions.
 
     Input:
         state: [B, N, state_dim]
 
-    Output:
-        alpha: [B, N, 1]   (global per-variable scaling)
-        beta:  [B, N, L]   (time-aware additive bias)
+    Outputs:
+        action_delta: [B, N, 3]
+            dynamic correction over static scale fusion logits
+        action_strength: [B, N]
     """
 
-    def __init__(self, state_dim, seq_len, hidden_dim=64, alpha_scale=0.1, beta_scale=0.1):
-        super(SelectionActor, self).__init__()
-        self.seq_len = seq_len
-        self.alpha_scale = alpha_scale
-        self.beta_scale = beta_scale
+    def __init__(self, state_dim, hidden_dim=64, action_scale=0.5):
+        super(ScalePreferenceActor, self).__init__()
+        self.action_scale = action_scale
 
         self.backbone = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
@@ -60,30 +105,20 @@ class SelectionActor(nn.Module):
             nn.GELU()
         )
 
-        # alpha remains lightweight global scaling per variable
-        self.alpha_head = nn.Linear(hidden_dim, 1)
-
-        # beta becomes time-aware additive calibration over temporal logits
-        self.beta_head = nn.Linear(hidden_dim, seq_len)
+        self.delta_head = nn.Linear(hidden_dim, 3)
 
     def forward(self, state):
         """
         state: [B, N, state_dim]
-        returns:
-            alpha: [B, N, 1]
-            beta:  [B, N, L]
         """
         h = self.backbone(state)
+        delta_raw = self.delta_head(h)  # [B, N, 3]
 
-        alpha_raw = self.alpha_head(h)  # [B, N, 1]
-        beta_raw = self.beta_head(h)    # [B, N, L]
+        # bounded dynamic preference correction
+        action_delta = self.action_scale * torch.tanh(delta_raw)  # [B, N, 3]
+        action_strength = torch.mean(torch.abs(action_delta), dim=-1)  # [B, N]
 
-        # Stable bounded actions:
-        # alpha around 1, beta around 0
-        alpha = 1.0 + self.alpha_scale * torch.tanh(alpha_raw)
-        beta = self.beta_scale * torch.tanh(beta_raw)
-
-        return alpha, beta
+        return action_delta, action_strength
 
 
 class SelectionCritic(nn.Module):
@@ -114,32 +149,17 @@ class SelectionCritic(nn.Module):
 
 class DynamicSelectionController(nn.Module):
     """
-    Dynamic controller for static temporal selection refinement.
+    RL controller for target-aware multi-scale temporal selection refinement.
 
-    Workflow:
-        base_logits z
-            -> state builder
-            -> actor(alpha, beta)
-            -> critic(value)
-            -> calibrated_logits zhat = alpha * z + beta
-            -> dynamic_weights = softmax(zhat / temperature)
-            -> selected_x_dynamic
+    Static selector provides:
+        - branch logits: z_raw, z_local, z_coarse
+        - static scale fusion weights
+        - base logits / base weights
 
-    Inputs:
-        x:            [B, L, N]
-        base_logits:  [B, N, L]
-        base_weights: [B, N, L]
-        agg_repr:     [B, N]
-
-    Outputs:
-        dict with:
-            state:             [B, N, state_dim]
-            alpha:             [B, N, 1]
-            beta:              [B, N, L]
-            value:             [B, N, 1]
-            calibrated_logits: [B, N, L]
-            dynamic_weights:   [B, N, L]
-            selected_x:        [B, L, N]
+    RL controller dynamically adjusts scale preference:
+        static scale logits + action_delta -> dynamic scale weights
+        dynamic scale weights fuse branch logits -> dynamic logits
+        dynamic logits -> dynamic temporal weights -> selected_x_dynamic
     """
 
     def __init__(
@@ -147,8 +167,7 @@ class DynamicSelectionController(nn.Module):
         seq_len,
         actor_hidden_dim=64,
         critic_hidden_dim=64,
-        alpha_scale=0.1,
-        beta_scale=0.1,
+        action_scale=0.5,
         eps=1e-8,
         temperature=1.0,
         residual_scale=0.5
@@ -161,12 +180,10 @@ class DynamicSelectionController(nn.Module):
 
         self.state_builder = SelectionStateBuilder(eps=eps)
 
-        self.actor = SelectionActor(
+        self.actor = ScalePreferenceActor(
             state_dim=self.state_builder.state_dim,
-            seq_len=seq_len,
             hidden_dim=actor_hidden_dim,
-            alpha_scale=alpha_scale,
-            beta_scale=beta_scale
+            action_scale=action_scale
         )
 
         self.critic = SelectionCritic(
@@ -174,52 +191,76 @@ class DynamicSelectionController(nn.Module):
             hidden_dim=critic_hidden_dim
         )
 
-    def calibrate_logits(self, base_logits, alpha, beta):
-        """
-        base_logits: [B, N, L]
-        alpha:       [B, N, 1]
-        beta:        [B, N, L]
-        """
-        calibrated_logits = alpha * base_logits + beta
-        return calibrated_logits
-
-    def forward(self, x, base_logits, base_weights, agg_repr):
+    def forward(
+        self,
+        x,
+        branch_logits,
+        base_weights,
+        agg_repr,
+        static_scale_weights,
+        summaries
+    ):
         """
         Args:
-            x:            [B, L, N]
-            base_logits:  [B, N, L]
-            base_weights: [B, N, L]
-            agg_repr:     [B, N]
+            x:                    [B, L, N]
+            branch_logits:
+                raw/local/coarse  [B, N, L]
+            base_weights:         [B, N, L]
+            agg_repr:             [B, N]
+            static_scale_weights: [B, N, 3]
+            summaries:
+                raw/local/coarse  [B, N]
 
         Returns:
             dict
         """
-        state = self.state_builder(base_logits, base_weights, agg_repr)  # [B, N, 4]
+        state = self.state_builder(
+            branch_logits=branch_logits,
+            base_weights=base_weights,
+            agg_repr=agg_repr,
+            static_scale_weights=static_scale_weights,
+            summaries=summaries
+        )  # [B, N, state_dim]
 
-        alpha, beta = self.actor(state)          # [B, N, 1], [B, N, L]
-        value = self.critic(state)               # [B, N, 1]
+        action_delta, action_strength = self.actor(state)  # [B, N, 3], [B, N]
+        value = self.critic(state)                         # [B, N, 1]
 
-        calibrated_logits = self.calibrate_logits(base_logits, alpha, beta)  # [B, N, L]
+        # convert static scale weights to logits-like domain for additive correction
+        static_scale_logits = torch.log(static_scale_weights + self.eps)  # [B, N, 3]
+        dynamic_scale_logits = static_scale_logits + action_delta          # [B, N, 3]
+        dynamic_scale_weights = torch.softmax(dynamic_scale_logits, dim=-1)  # [B, N, 3]
 
-        # Keep dynamic branch semantically aligned with static selector:
-        # same temperature-scaled softmax over temporal dimension.
-        dynamic_weights = torch.softmax(calibrated_logits / self.temperature, dim=-1)  # [B, N, L]
+        w_raw = dynamic_scale_weights[..., 0].unsqueeze(-1)      # [B, N, 1]
+        w_local = dynamic_scale_weights[..., 1].unsqueeze(-1)    # [B, N, 1]
+        w_coarse = dynamic_scale_weights[..., 2].unsqueeze(-1)   # [B, N, 1]
 
-        # x: [B, L, N] -> [B, N, L]
-        x_var = x.permute(0, 2, 1)
+        z_raw = branch_logits['raw']         # [B, N, L]
+        z_local = branch_logits['local']     # [B, N, L]
+        z_coarse = branch_logits['coarse']   # [B, N, L]
 
-        # Keep selected_x construction semantically consistent with static selector:
-        # residual modulation instead of direct probability masking.
+        calibrated_logits = w_raw * z_raw + w_local * z_local + w_coarse * z_coarse  # [B, N, L]
+        dynamic_weights = torch.softmax(calibrated_logits / self.temperature, dim=-1) # [B, N, L]
+
+        x_var = x.permute(0, 2, 1)  # [B, N, L]
+
         modulation = 1.0 + self.residual_scale * dynamic_weights
         selected_x_var = x_var * modulation
         selected_x = selected_x_var.permute(0, 2, 1)  # [B, L, N]
 
         return {
             'state': state,
-            'alpha': alpha,
-            'beta': beta,
             'value': value,
-            'calibrated_logits': calibrated_logits,
-            'dynamic_weights': dynamic_weights,
-            'selected_x': selected_x
+
+            # RL actions
+            'action_delta': action_delta,                  # [B, N, 3]
+            'action_strength': action_strength,            # [B, N]
+
+            # dynamic scale preference
+            'dynamic_scale_logits': dynamic_scale_logits,  # [B, N, 3]
+            'dynamic_scale_weights': dynamic_scale_weights,# [B, N, 3]
+
+            # dynamic temporal selection
+            'calibrated_logits': calibrated_logits,        # [B, N, L]
+            'dynamic_weights': dynamic_weights,            # [B, N, L]
+            'selected_x': selected_x                       # [B, L, N]
         }
