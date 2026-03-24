@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import Normal
 
 
 class SelectionStateBuilder(nn.Module):
@@ -12,9 +13,9 @@ class SelectionStateBuilder(nn.Module):
             raw    [B, N, L]
             local  [B, N, L]
             coarse [B, N, L]
-        base_weights:        [B, N, L]
-        agg_repr:            [B, N]
-        static_scale_weights:[B, N, 3]
+        base_weights:         [B, N, L]
+        agg_repr:             [B, N]
+        static_scale_weights: [B, N, 3]
         summaries:
             raw    [B, N]
             local  [B, N]
@@ -83,15 +84,18 @@ class SelectionStateBuilder(nn.Module):
 
 class ScalePreferenceActor(nn.Module):
     """
-    Actor outputs dynamic scale preference actions.
+    Stochastic actor for dynamic scale preference control.
 
     Input:
         state: [B, N, state_dim]
 
     Outputs:
-        action_delta: [B, N, 3]
-            dynamic correction over static scale fusion logits
-        action_strength: [B, N]
+        action_mean:   [B, N, 3]
+        action_std:    [B, N, 3]
+        action_delta:  [B, N, 3]   (sampled action in bounded space)
+        log_prob:      [B, N]
+        entropy:       [B, N]
+        action_strength:[B, N]
     """
 
     def __init__(self, state_dim, hidden_dim=64, action_scale=0.5):
@@ -105,20 +109,58 @@ class ScalePreferenceActor(nn.Module):
             nn.GELU()
         )
 
-        self.delta_head = nn.Linear(hidden_dim, 3)
+        # mean of action distribution
+        self.mean_head = nn.Linear(hidden_dim, 3)
 
-    def forward(self, state):
+        # state-dependent log-std
+        self.log_std_head = nn.Linear(hidden_dim, 3)
+
+        # numerical bounds for stability
+        self.min_log_std = -5.0
+        self.max_log_std = 1.0
+
+    def forward(self, state, deterministic=False):
         """
         state: [B, N, state_dim]
+        deterministic:
+            - False during training: sample stochastic action
+            - True during evaluation: use mean action
         """
         h = self.backbone(state)
-        delta_raw = self.delta_head(h)  # [B, N, 3]
 
-        # bounded dynamic preference correction
-        action_delta = self.action_scale * torch.tanh(delta_raw)  # [B, N, 3]
+        action_mean_raw = self.mean_head(h)                      # [B, N, 3]
+        action_log_std = self.log_std_head(h)                   # [B, N, 3]
+        action_log_std = torch.clamp(action_log_std, self.min_log_std, self.max_log_std)
+        action_std = torch.exp(action_log_std)                  # [B, N, 3]
+
+        dist = Normal(action_mean_raw, action_std)
+
+        if deterministic:
+            sampled_raw = action_mean_raw
+        else:
+            sampled_raw = dist.rsample()  # reparameterized sample
+
+        # bounded action in [-action_scale, action_scale]
+        action_delta = self.action_scale * torch.tanh(sampled_raw)   # [B, N, 3]
+
+        # approximate log-prob on pre-tanh action for policy gradient
+        # This is a practical approximation and keeps the implementation lightweight.
+        # Shape: [B, N, 3] -> sum over action dim => [B, N]
+        log_prob = dist.log_prob(sampled_raw).sum(dim=-1)
+
+        # entropy for optional diagnostics / regularization
+        entropy = dist.entropy().sum(dim=-1)  # [B, N]
+
         action_strength = torch.mean(torch.abs(action_delta), dim=-1)  # [B, N]
 
-        return action_delta, action_strength
+        return {
+            'action_mean': action_mean_raw,   # pre-tanh mean
+            'action_std': action_std,
+            'action_delta': action_delta,
+            'log_prob': log_prob,
+            'entropy': entropy,
+            'action_strength': action_strength
+        }
 
 
 class SelectionCritic(nn.Module):
@@ -154,10 +196,10 @@ class DynamicSelectionController(nn.Module):
     Static selector provides:
         - branch logits: z_raw, z_local, z_coarse
         - static scale fusion weights
-        - base logits / base weights
+        - base weights
 
     RL controller dynamically adjusts scale preference:
-        static scale logits + action_delta -> dynamic scale weights
+        static scale logits + sampled action_delta -> dynamic scale weights
         dynamic scale weights fuse branch logits -> dynamic logits
         dynamic logits -> dynamic temporal weights -> selected_x_dynamic
     """
@@ -198,7 +240,8 @@ class DynamicSelectionController(nn.Module):
         base_weights,
         agg_repr,
         static_scale_weights,
-        summaries
+        summaries,
+        deterministic=False
     ):
         """
         Args:
@@ -210,6 +253,8 @@ class DynamicSelectionController(nn.Module):
             static_scale_weights: [B, N, 3]
             summaries:
                 raw/local/coarse  [B, N]
+            deterministic:
+                False in training; True in eval/inference
 
         Returns:
             dict
@@ -222,13 +267,20 @@ class DynamicSelectionController(nn.Module):
             summaries=summaries
         )  # [B, N, state_dim]
 
-        action_delta, action_strength = self.actor(state)  # [B, N, 3], [B, N]
-        value = self.critic(state)                         # [B, N, 1]
+        actor_out = self.actor(state, deterministic=deterministic)
+        action_delta = actor_out['action_delta']        # [B, N, 3]
+        log_prob = actor_out['log_prob']                # [B, N]
+        entropy = actor_out['entropy']                  # [B, N]
+        action_strength = actor_out['action_strength']  # [B, N]
+        action_mean = actor_out['action_mean']          # [B, N, 3]
+        action_std = actor_out['action_std']            # [B, N, 3]
+
+        value = self.critic(state)                      # [B, N, 1]
 
         # convert static scale weights to logits-like domain for additive correction
-        static_scale_logits = torch.log(static_scale_weights + self.eps)  # [B, N, 3]
-        dynamic_scale_logits = static_scale_logits + action_delta          # [B, N, 3]
-        dynamic_scale_weights = torch.softmax(dynamic_scale_logits, dim=-1)  # [B, N, 3]
+        static_scale_logits = torch.log(static_scale_weights + self.eps)      # [B, N, 3]
+        dynamic_scale_logits = static_scale_logits + action_delta             # [B, N, 3]
+        dynamic_scale_weights = torch.softmax(dynamic_scale_logits, dim=-1)   # [B, N, 3]
 
         w_raw = dynamic_scale_weights[..., 0].unsqueeze(-1)      # [B, N, 1]
         w_local = dynamic_scale_weights[..., 1].unsqueeze(-1)    # [B, N, 1]
@@ -242,7 +294,6 @@ class DynamicSelectionController(nn.Module):
         dynamic_weights = torch.softmax(calibrated_logits / self.temperature, dim=-1) # [B, N, L]
 
         x_var = x.permute(0, 2, 1)  # [B, N, L]
-
         modulation = 1.0 + self.residual_scale * dynamic_weights
         selected_x_var = x_var * modulation
         selected_x = selected_x_var.permute(0, 2, 1)  # [B, L, N]
@@ -251,16 +302,20 @@ class DynamicSelectionController(nn.Module):
             'state': state,
             'value': value,
 
-            # RL actions
-            'action_delta': action_delta,                  # [B, N, 3]
-            'action_strength': action_strength,            # [B, N]
+            # actor outputs
+            'action_mean': action_mean,                  # [B, N, 3]
+            'action_std': action_std,                    # [B, N, 3]
+            'action_delta': action_delta,                # [B, N, 3]
+            'log_prob': log_prob,                        # [B, N]
+            'entropy': entropy,                          # [B, N]
+            'action_strength': action_strength,          # [B, N]
 
             # dynamic scale preference
-            'dynamic_scale_logits': dynamic_scale_logits,  # [B, N, 3]
-            'dynamic_scale_weights': dynamic_scale_weights,# [B, N, 3]
+            'dynamic_scale_logits': dynamic_scale_logits,      # [B, N, 3]
+            'dynamic_scale_weights': dynamic_scale_weights,    # [B, N, 3]
 
             # dynamic temporal selection
-            'calibrated_logits': calibrated_logits,        # [B, N, L]
-            'dynamic_weights': dynamic_weights,            # [B, N, L]
-            'selected_x': selected_x                       # [B, L, N]
+            'calibrated_logits': calibrated_logits,      # [B, N, L]
+            'dynamic_weights': dynamic_weights,          # [B, N, L]
+            'selected_x': selected_x                     # [B, L, N]
         }
