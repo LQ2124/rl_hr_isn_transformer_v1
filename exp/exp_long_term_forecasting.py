@@ -31,6 +31,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         self.reward_type = getattr(args, 'reward_type', 'improve_over_static')
         self.reward_scale = getattr(args, 'reward_scale', 1.0)
 
+        # optional entropy regularization for stochastic policy
+        self.eta_ent = getattr(args, 'eta_ent', 0.0)
+
     def _build_model(self):
         model = self.model_dict[self.args.model](self.args).float()
 
@@ -102,18 +105,15 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
     def _align_aux_with_target_dim(self, aux_tensor, target_tensor):
         """
-        Align aux outputs (e.g., static_pred / value / action_strength)
+        Align aux outputs (e.g., static_pred / value / action_strength / log_prob / entropy)
         with target output dimensionality after trainer-side f_dim slicing.
 
         aux_tensor examples:
             static_pred      [B, pred_len, N]
             value            [B, N, 1] or [B, N]
             action_strength  [B, N]
-        target_tensor:
-            batch_y_target or dynamic_pred after f_dim slicing
-
-        Returns:
-            aligned aux_tensor compatible with target output dimension C_tgt.
+            log_prob         [B, N]
+            entropy          [B, N]
         """
         if aux_tensor is None:
             return None
@@ -125,7 +125,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             aux_c = aux_tensor.shape[-1]
             if aux_c == target_c:
                 return aux_tensor
-            # mimic the same slicing rule used in trainer outputs
             if self.args.features == 'MS':
                 return aux_tensor[:, :, -target_c:]
             else:
@@ -161,11 +160,12 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             aux should contain:
                 - static_pred: [B, pred_len, C_full] or aligned
                 - value: [B, N, 1] or compatible
-                - action_strength: [B, N]
+                - log_prob: [B, N]
+                - entropy: [B, N] (optional)
         Returns:
             rl_items dict
         """
-        required_keys = ['static_pred', 'value', 'action_strength']
+        required_keys = ['static_pred', 'value', 'log_prob']
         if not all(k in aux for k in required_keys):
             zero = dynamic_pred.new_tensor(0.0)
             return {
@@ -175,18 +175,23 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 'advantage': zero,
                 'actor_loss': zero,
                 'critic_loss': zero,
+                'entropy_loss': zero,
                 'reward_mean': 0.0,
-                'advantage_mean': 0.0
+                'advantage_mean': 0.0,
+                'entropy_mean': 0.0
             }
 
         static_pred = aux['static_pred']
         value = aux['value']
-        action_strength = aux['action_strength']
+        log_prob = aux['log_prob']
+        entropy = aux.get('entropy', None)
 
-        # -------- IMPORTANT FIX: align aux tensors to trainer-side target dimensionality --------
+        # -------- IMPORTANT ALIGNMENT --------
         static_pred = self._align_aux_with_target_dim(static_pred, batch_y_target)
         value = self._align_aux_with_target_dim(value, batch_y_target)
-        action_strength = self._align_aux_with_target_dim(action_strength, batch_y_target)
+        log_prob = self._align_aux_with_target_dim(log_prob, batch_y_target)
+        if entropy is not None:
+            entropy = self._align_aux_with_target_dim(entropy, batch_y_target)
 
         # Per-variable forecasting loss over prediction horizon
         # [B, pred_len, C] -> mean over time dim => [B, C]
@@ -215,31 +220,35 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             static_loss_var = static_loss_elem.mean(dim=1)   # [B, C]
             dynamic_loss_var = dynamic_loss_elem.mean(dim=1) # [B, C]
         else:
-            # fallback
             static_loss_var = ((static_pred - batch_y_target) ** 2).mean(dim=1)
             dynamic_loss_var = ((dynamic_pred - batch_y_target) ** 2).mean(dim=1)
 
-        # Scalar supervised losses for logging
         static_sup_loss = static_loss_var.mean()
         dynamic_sup_loss = dynamic_loss_var.mean()
 
-        # Reward: [B, C]
-        reward = self._compute_reward(static_loss_var.detach(), dynamic_loss_var.detach())
+        reward = self._compute_reward(static_loss_var.detach(), dynamic_loss_var.detach())  # [B, C]
 
-        # Critic output: [B, C, 1] or [B, C]
         if value.dim() == 3:
-            value_pred = value.squeeze(-1)
+            value_pred = value.squeeze(-1)   # [B, C]
         else:
-            value_pred = value
+            value_pred = value               # [B, C]
 
-        # Lightweight advantage baseline
-        advantage = reward - value_pred
+        advantage = reward - value_pred      # [B, C]
 
-        # Surrogate actor objective
-        actor_loss = -(advantage.detach() * action_strength).mean()
+        # ------------------ KEY CHANGE ------------------
+        # True policy-gradient-style surrogate:
+        # encourage actions with high advantage and suppress those with low advantage
+        actor_loss = -(log_prob * advantage.detach()).mean()
 
-        # Critic objective
         critic_loss = nn.functional.mse_loss(value_pred, reward.detach())
+
+        if entropy is not None:
+            # maximize entropy <=> minimize negative entropy
+            entropy_loss = -entropy.mean()
+            entropy_mean = entropy.detach().mean().item()
+        else:
+            entropy_loss = dynamic_pred.new_tensor(0.0)
+            entropy_mean = 0.0
 
         return {
             'static_sup_loss': static_sup_loss,
@@ -248,8 +257,10 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             'advantage': advantage,
             'actor_loss': actor_loss,
             'critic_loss': critic_loss,
+            'entropy_loss': entropy_loss,
             'reward_mean': reward.detach().mean().item(),
-            'advantage_mean': advantage.detach().mean().item()
+            'advantage_mean': advantage.detach().mean().item(),
+            'entropy_mean': entropy_mean
         }
 
     def _compute_total_loss(self, outputs, batch_y, criterion, aux=None, epoch=0, return_items=False):
@@ -262,13 +273,12 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             aux = {}
 
         sup_loss = criterion(outputs, batch_y)
-
         sparse_loss = aux.get('sparse_loss', sup_loss.new_tensor(0.0))
 
-        # -------- trainer-side RL loss computation --------
         rl_items = self._compute_rl_losses(aux, outputs, batch_y, criterion)
         actor_loss = rl_items['actor_loss']
         critic_loss = rl_items['critic_loss']
+        entropy_loss = rl_items['entropy_loss']
 
         eta_a_eff, eta_c_eff = self._get_rl_weights(epoch)
 
@@ -281,6 +291,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             + self.sparse_lambda * sparse_loss
             + eta_a_eff * actor_loss
             + eta_c_eff * critic_loss
+            + self.eta_ent * entropy_loss
         )
 
         if return_items:
@@ -291,9 +302,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 'sparse_loss': sparse_loss.detach().item() if torch.is_tensor(sparse_loss) else float(sparse_loss),
                 'actor_loss': actor_loss.detach().item() if torch.is_tensor(actor_loss) else float(actor_loss),
                 'critic_loss': critic_loss.detach().item() if torch.is_tensor(critic_loss) else float(critic_loss),
+                'entropy_loss': entropy_loss.detach().item() if torch.is_tensor(entropy_loss) else float(entropy_loss),
                 'total_loss': total_loss.detach().item(),
                 'reward_mean': rl_items['reward_mean'],
                 'advantage_mean': rl_items['advantage_mean'],
+                'entropy_mean': rl_items['entropy_mean'],
                 'eta_a_eff': eta_a_eff,
                 'eta_c_eff': eta_c_eff
             }
@@ -307,6 +320,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         total_sparse_loss = []
         total_actor_loss = []
         total_critic_loss = []
+        total_entropy_loss = []
 
         self.model.eval()
         with torch.no_grad():
@@ -317,7 +331,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
 
-                # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
 
@@ -347,6 +360,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 total_sparse_loss.append(sparse_loss.item() if torch.is_tensor(sparse_loss) else float(sparse_loss))
                 total_actor_loss.append(rl_items['actor_loss'].item() if torch.is_tensor(rl_items['actor_loss']) else 0.0)
                 total_critic_loss.append(rl_items['critic_loss'].item() if torch.is_tensor(rl_items['critic_loss']) else 0.0)
+                total_entropy_loss.append(rl_items['entropy_loss'].item() if torch.is_tensor(rl_items['entropy_loss']) else 0.0)
 
         avg_sup_loss = np.average(total_sup_loss)
         avg_static_sup = np.average(total_static_sup_loss)
@@ -354,16 +368,16 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         avg_sparse_loss = np.average(total_sparse_loss)
         avg_actor_loss = np.average(total_actor_loss)
         avg_critic_loss = np.average(total_critic_loss)
+        avg_entropy_loss = np.average(total_entropy_loss)
 
         self.model.train()
 
         print(
-            "Validation | Sup: {:.7f} StaticSup: {:.7f} DynamicSup: {:.7f} Sparse: {:.7f} Actor: {:.7f} Critic: {:.7f}".format(
-                avg_sup_loss, avg_static_sup, avg_dynamic_sup, avg_sparse_loss, avg_actor_loss, avg_critic_loss
+            "Validation | Sup: {:.7f} StaticSup: {:.7f} DynamicSup: {:.7f} Sparse: {:.7f} Actor: {:.7f} Critic: {:.7f} Ent: {:.7f}".format(
+                avg_sup_loss, avg_static_sup, avg_dynamic_sup, avg_sparse_loss, avg_actor_loss, avg_critic_loss, avg_entropy_loss
             )
         )
 
-        # Early stopping still uses supervised forecasting quality
         return avg_sup_loss
 
     def train(self, setting):
@@ -395,8 +409,10 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             train_sparse_loss = []
             train_actor_loss = []
             train_critic_loss = []
+            train_entropy_loss = []
             train_reward_mean = []
             train_advantage_mean = []
+            train_entropy_mean = []
 
             self.model.train()
             epoch_time = time.time()
@@ -410,7 +426,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
 
-                # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
 
@@ -445,12 +460,14 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 train_sparse_loss.append(loss_items['sparse_loss'])
                 train_actor_loss.append(loss_items['actor_loss'])
                 train_critic_loss.append(loss_items['critic_loss'])
+                train_entropy_loss.append(loss_items['entropy_loss'])
                 train_reward_mean.append(loss_items['reward_mean'])
                 train_advantage_mean.append(loss_items['advantage_mean'])
+                train_entropy_mean.append(loss_items['entropy_mean'])
 
                 if (i + 1) % 100 == 0:
                     print(
-                        "\titers: {0}, epoch: {1} | total: {2:.7f} | sup: {3:.7f} | static_sup: {4:.7f} | dynamic_sup: {5:.7f} | sparse: {6:.7f} | actor: {7:.7f} | critic: {8:.7f} | reward: {9:.7f} | adv: {10:.7f}".format(
+                        "\titers: {0}, epoch: {1} | total: {2:.7f} | sup: {3:.7f} | static_sup: {4:.7f} | dynamic_sup: {5:.7f} | sparse: {6:.7f} | actor: {7:.7f} | critic: {8:.7f} | ent_loss: {9:.7f} | reward: {10:.7f} | adv: {11:.7f} | ent: {12:.7f}".format(
                             i + 1,
                             epoch + 1,
                             loss_items['total_loss'],
@@ -460,12 +477,14 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                             loss_items['sparse_loss'],
                             loss_items['actor_loss'],
                             loss_items['critic_loss'],
+                            loss_items['entropy_loss'],
                             loss_items['reward_mean'],
-                            loss_items['advantage_mean']
+                            loss_items['advantage_mean'],
+                            loss_items['entropy_mean']
                         )
                     )
-                    print("\tRL weights -> eta_a_eff: {:.6f}, eta_c_eff: {:.6f}".format(
-                        loss_items['eta_a_eff'], loss_items['eta_c_eff']
+                    print("\tRL weights -> eta_a_eff: {:.6f}, eta_c_eff: {:.6f}, eta_ent: {:.6f}".format(
+                        loss_items['eta_a_eff'], loss_items['eta_c_eff'], self.eta_ent
                     ))
 
                     speed = (time.time() - time_now) / iter_count
@@ -492,16 +511,18 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             train_sparse_avg = np.average(train_sparse_loss)
             train_actor_avg = np.average(train_actor_loss)
             train_critic_avg = np.average(train_critic_loss)
+            train_entropy_loss_avg = np.average(train_entropy_loss)
             train_reward_avg = np.average(train_reward_mean)
             train_adv_avg = np.average(train_advantage_mean)
+            train_ent_avg = np.average(train_entropy_mean)
 
             vali_loss = self.vali(vali_data, vali_loader, criterion)
             test_loss = self.vali(test_data, test_loader, criterion)
 
             print(
                 "Epoch: {0}, Steps: {1} | Train Total: {2:.7f} Sup: {3:.7f} StaticSup: {4:.7f} DynamicSup: {5:.7f} "
-                "Sparse: {6:.7f} Actor: {7:.7f} Critic: {8:.7f} Reward: {9:.7f} Adv: {10:.7f} | "
-                "Vali Sup: {11:.7f} Test Sup: {12:.7f}".format(
+                "Sparse: {6:.7f} Actor: {7:.7f} Critic: {8:.7f} EntLoss: {9:.7f} Reward: {10:.7f} Adv: {11:.7f} Ent: {12:.7f} | "
+                "Vali Sup: {13:.7f} Test Sup: {14:.7f}".format(
                     epoch + 1,
                     train_steps,
                     train_total_avg,
@@ -511,8 +532,10 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     train_sparse_avg,
                     train_actor_avg,
                     train_critic_avg,
+                    train_entropy_loss_avg,
                     train_reward_avg,
                     train_adv_avg,
+                    train_ent_avg,
                     vali_loss,
                     test_loss
                 )
