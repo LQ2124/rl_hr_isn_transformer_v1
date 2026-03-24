@@ -14,16 +14,16 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='iTransformer_TemporalRL')
 
-    # basic configgit --version
-    parser.add_argument('--task_name', type=str,  default='long_term_forecast',
+    # basic config
+    parser.add_argument('--task_name', type=str, default='long_term_forecast',
                         help='task name, options:[long_term_forecast, short_term_forecast, imputation, classification, anomaly_detection]')
     parser.add_argument('--is_training', type=int, default=1, help='status')
-    parser.add_argument('--model_id', type=str,  default='test', help='model id')
-    parser.add_argument('--model', type=str,  default='iTransformer_TemporalRL',
+    parser.add_argument('--model_id', type=str, default='test', help='model id')
+    parser.add_argument('--model', type=str, default='iTransformer_TemporalRL',
                         help='model name, options: [Autoformer, Transformer, TimesNet, iTransformer, iTransformer_Temporal, iTransformer_TemporalRL]')
 
     # data loader
-    parser.add_argument('--data', type=str,  default='custom', help='dataset type')
+    parser.add_argument('--data', type=str, default='custom', help='dataset type')
     parser.add_argument('--root_path', type=str, default='../Time-Series-Library-main/data/', help='root path of the data file')
     parser.add_argument('--data_path', type=str, default='US.csv', help='data file')
     parser.add_argument('--features', type=str, default='MS',
@@ -48,7 +48,7 @@ if __name__ == '__main__':
 
     # model define
     parser.add_argument('--expand', type=int, default=2, help='expansion factor for Mamba')
-    parser.add_argument('--d_conv', type=int, default=4, help='conv kernel size for Mamba')
+    parser.add_argument('--d_conv', type=int, default=4, help='conv kernel size for MambaSL')
     parser.add_argument('--tv_dt', type=int, default=0, help='whether to use time variant dt for MambaSL')
     parser.add_argument('--tv_B', type=int, default=0, help='whether to use time variant B for MambaSL')
     parser.add_argument('--tv_C', type=int, default=0, help='whether to use time variant C for MambaSL')
@@ -99,7 +99,7 @@ if __name__ == '__main__':
                         help='sparsity type, options: [entropy, logits_l1, none]')
 
     # dynamic RL switch
-    parser.add_argument('--use_dynamic_rl', type=int, default=0,
+    parser.add_argument('--use_dynamic_rl', type=int, default=1,
                         help='whether to enable dynamic RL losses in trainer')
 
     # actor / critic config
@@ -109,10 +109,12 @@ if __name__ == '__main__':
                         help='hidden dimension for lightweight critic')
 
     # RL loss weights
-    parser.add_argument('--eta_a', type=float, default=0.0,
+    parser.add_argument('--eta_a', type=float, default=0.1,
                         help='weight for actor loss')
-    parser.add_argument('--eta_c', type=float, default=0.0,
+    parser.add_argument('--eta_c', type=float, default=0.1,
                         help='weight for critic loss')
+    parser.add_argument('--eta_ent', type=float, default=0.001,
+                        help='weight for entropy regularization')
 
     # RL warmup
     parser.add_argument('--rl_warmup_epochs', type=int, default=0,
@@ -129,6 +131,16 @@ if __name__ == '__main__':
                         help='bounded adjustment scale for alpha around 1.0')
     parser.add_argument('--beta_scale', type=float, default=0.1,
                         help='bounded adjustment scale for beta around 0.0')
+    parser.add_argument('--action_scale', type=float, default=0.5,
+                        help='bounded scale preference correction range for RL action')
+
+    # multi-scale selector params
+    parser.add_argument('--local_kernel_size', type=int, default=5,
+                        help='kernel size for local-scale temporal branch')
+    parser.add_argument('--coarse_ratio', type=int, default=4,
+                        help='downsampling ratio for coarse-scale temporal branch')
+    parser.add_argument('--residual_scale', type=float, default=0.5,
+                        help='residual modulation scale for temporal selection')
 
     # optimization
     parser.add_argument('--num_workers', type=int, default=10, help='data loader num workers')
@@ -248,7 +260,7 @@ if __name__ == '__main__':
 
     if args.is_training:
         for ii in range(args.itr):
-            setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_expand{}_dc{}_fc{}_eb{}_dt{}_sp{}_loss{}_rl{}_etaa{}_etac{}_rw{}_{}_{}'.format(
+            setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_expand{}_dc{}_fc{}_eb{}_dt{}_sp{}_loss{}_rl{}_etaa{}_etac{}_etaent{}_rw{}_{}_{}'.format(
                 args.task_name,
                 args.model_id,
                 args.model,
@@ -272,6 +284,7 @@ if __name__ == '__main__':
                 args.use_dynamic_rl,
                 args.eta_a,
                 args.eta_c,
+                args.eta_ent,
                 args.reward_type,
                 args.des,
                 ii
@@ -296,9 +309,10 @@ if __name__ == '__main__':
                     torch.backends.mps.empty_cache()
                 elif args.gpu_type == 'cuda':
                     torch.cuda.empty_cache()
+
     else:
         ii = 0
-        setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_expand{}_dc{}_fc{}_eb{}_dt{}_sp{}_loss{}_rl{}_etaa{}_etac{}_rw{}_{}_{}'.format(
+        setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_expand{}_dc{}_fc{}_eb{}_dt{}_sp{}_loss{}_rl{}_etaa{}_etac{}_etaent{}_rw{}_{}_{}'.format(
             args.task_name,
             args.model_id,
             args.model,
@@ -322,6 +336,7 @@ if __name__ == '__main__':
             args.use_dynamic_rl,
             args.eta_a,
             args.eta_c,
+            args.eta_ent,
             args.reward_type,
             args.des,
             ii
