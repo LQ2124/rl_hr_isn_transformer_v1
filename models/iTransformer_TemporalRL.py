@@ -140,6 +140,7 @@ class Model(nn.Module):
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         """
         Dynamic forecasting path.
+
         Returns:
             dynamic_pred: [B, pred_len, N]
             aux: dict containing static/dynamic intermediate quantities
@@ -176,14 +177,19 @@ class Model(nn.Module):
             base_weights=base_weights,
             agg_repr=agg_repr,
             static_scale_weights=static_scale_weights,
-            summaries=summaries
+            summaries=summaries,
+            deterministic=(not self.training)
         )
 
         dynamic_selected_x = dynamic_out['selected_x']                # [B, L, N]
         state = dynamic_out['state']                                  # [B, N, state_dim]
         value = dynamic_out['value']                                  # [B, N, 1]
 
+        action_mean = dynamic_out['action_mean']                      # [B, N, 3]
+        action_std = dynamic_out['action_std']                        # [B, N, 3]
         action_delta = dynamic_out['action_delta']                    # [B, N, 3]
+        log_prob = dynamic_out['log_prob']                            # [B, N]
+        entropy = dynamic_out['entropy']                              # [B, N]
         action_strength = dynamic_out['action_strength']              # [B, N]
 
         dynamic_scale_logits = dynamic_out['dynamic_scale_logits']    # [B, N, 3]
@@ -217,8 +223,14 @@ class Model(nn.Module):
             # dynamic RL outputs
             'state': state,
             'value': value,
+
+            'action_mean': action_mean,
+            'action_std': action_std,
             'action_delta': action_delta,
+            'log_prob': log_prob,
+            'entropy': entropy,
             'action_strength': action_strength,
+
             'dynamic_scale_logits': dynamic_scale_logits,
             'dynamic_scale_weights': dynamic_scale_weights,
             'calibrated_logits': calibrated_logits,
@@ -244,7 +256,8 @@ class Model(nn.Module):
             base_weights=static_out['weights'],
             agg_repr=static_out['agg_repr'],
             static_scale_weights=static_out['scale_weights'],
-            summaries=static_out['summaries']
+            summaries=static_out['summaries'],
+            deterministic=(not self.training)
         )
 
         dynamic_selected_x = dynamic_out['selected_x']
@@ -261,7 +274,11 @@ class Model(nn.Module):
 
             'state': dynamic_out['state'],
             'value': dynamic_out['value'],
+            'action_mean': dynamic_out['action_mean'],
+            'action_std': dynamic_out['action_std'],
             'action_delta': dynamic_out['action_delta'],
+            'log_prob': dynamic_out['log_prob'],
+            'entropy': dynamic_out['entropy'],
             'action_strength': dynamic_out['action_strength'],
             'dynamic_scale_logits': dynamic_out['dynamic_scale_logits'],
             'dynamic_scale_weights': dynamic_out['dynamic_scale_weights'],
@@ -286,7 +303,8 @@ class Model(nn.Module):
             base_weights=static_out['weights'],
             agg_repr=static_out['agg_repr'],
             static_scale_weights=static_out['scale_weights'],
-            summaries=static_out['summaries']
+            summaries=static_out['summaries'],
+            deterministic=(not self.training)
         )
 
         dynamic_selected_x = dynamic_out['selected_x']
@@ -303,7 +321,11 @@ class Model(nn.Module):
 
             'state': dynamic_out['state'],
             'value': dynamic_out['value'],
+            'action_mean': dynamic_out['action_mean'],
+            'action_std': dynamic_out['action_std'],
             'action_delta': dynamic_out['action_delta'],
+            'log_prob': dynamic_out['log_prob'],
+            'entropy': dynamic_out['entropy'],
             'action_strength': dynamic_out['action_strength'],
             'dynamic_scale_logits': dynamic_out['dynamic_scale_logits'],
             'dynamic_scale_weights': dynamic_out['dynamic_scale_weights'],
@@ -325,7 +347,8 @@ class Model(nn.Module):
             base_weights=static_out['weights'],
             agg_repr=static_out['agg_repr'],
             static_scale_weights=static_out['scale_weights'],
-            summaries=static_out['summaries']
+            summaries=static_out['summaries'],
+            deterministic=(not self.training)
         )
 
         dynamic_selected_x = dynamic_out['selected_x']
@@ -349,7 +372,11 @@ class Model(nn.Module):
 
             'state': dynamic_out['state'],
             'value': dynamic_out['value'],
+            'action_mean': dynamic_out['action_mean'],
+            'action_std': dynamic_out['action_std'],
             'action_delta': dynamic_out['action_delta'],
+            'log_prob': dynamic_out['log_prob'],
+            'entropy': dynamic_out['entropy'],
             'action_strength': dynamic_out['action_strength'],
             'dynamic_scale_logits': dynamic_out['dynamic_scale_logits'],
             'dynamic_scale_weights': dynamic_out['dynamic_scale_weights'],
