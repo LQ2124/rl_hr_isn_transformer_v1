@@ -13,9 +13,9 @@ class Model(nn.Module):
     """
     Dynamic temporal selection + lightweight actor-critic + iTransformer backbone
 
-    Upgraded design:
-        RL controls target-aware multi-scale scale preference,
-        instead of weak point-wise affine logit perturbation.
+    Residual-gated dynamic design:
+        static selector provides the main path,
+        RL only performs conservative residual scale correction.
     """
 
     def __init__(self, configs):
@@ -188,6 +188,7 @@ class Model(nn.Module):
         action_mean = dynamic_out['action_mean']                      # [B, N, 3]
         action_std = dynamic_out['action_std']                        # [B, N, 3]
         action_delta = dynamic_out['action_delta']                    # [B, N, 3]
+        gate_alpha = dynamic_out['gate_alpha']                        # [B, N, 1]
         log_prob = dynamic_out['log_prob']                            # [B, N]
         entropy = dynamic_out['entropy']                              # [B, N]
         action_strength = dynamic_out['action_strength']              # [B, N]
@@ -227,6 +228,7 @@ class Model(nn.Module):
             'action_mean': action_mean,
             'action_std': action_std,
             'action_delta': action_delta,
+            'gate_alpha': gate_alpha,
             'log_prob': log_prob,
             'entropy': entropy,
             'action_strength': action_strength,
@@ -277,6 +279,7 @@ class Model(nn.Module):
             'action_mean': dynamic_out['action_mean'],
             'action_std': dynamic_out['action_std'],
             'action_delta': dynamic_out['action_delta'],
+            'gate_alpha': dynamic_out['gate_alpha'],
             'log_prob': dynamic_out['log_prob'],
             'entropy': dynamic_out['entropy'],
             'action_strength': dynamic_out['action_strength'],
@@ -324,6 +327,7 @@ class Model(nn.Module):
             'action_mean': dynamic_out['action_mean'],
             'action_std': dynamic_out['action_std'],
             'action_delta': dynamic_out['action_delta'],
+            'gate_alpha': dynamic_out['gate_alpha'],
             'log_prob': dynamic_out['log_prob'],
             'entropy': dynamic_out['entropy'],
             'action_strength': dynamic_out['action_strength'],
@@ -375,6 +379,7 @@ class Model(nn.Module):
             'action_mean': dynamic_out['action_mean'],
             'action_std': dynamic_out['action_std'],
             'action_delta': dynamic_out['action_delta'],
+            'gate_alpha': dynamic_out['gate_alpha'],
             'log_prob': dynamic_out['log_prob'],
             'entropy': dynamic_out['entropy'],
             'action_strength': dynamic_out['action_strength'],
