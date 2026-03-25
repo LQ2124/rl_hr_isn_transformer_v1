@@ -23,16 +23,6 @@ class SelectionStateBuilder(nn.Module):
 
     Output:
         state: [B, N, state_dim]
-
-    Notes:
-        We enhance the state with:
-        1) target-aware multi-scale summaries
-        2) target regime-aware lightweight statistics
-        3) target branch disagreement signals
-
-        For minimal code intrusion, we assume in MS setting the target is aligned
-        with the last variable dimension, which is consistent with trainer-side
-        target slicing logic (f_dim = -1 for MS).
     """
 
     def __init__(self, eps=1e-8, target_index=-1):
@@ -40,21 +30,7 @@ class SelectionStateBuilder(nn.Module):
         self.eps = eps
         self.target_index = target_index
 
-        # Original state:
-        # [agg_repr,
-        #  raw_summary, local_summary, coarse_summary,
-        #  base_entropy,
-        #  raw_local_gap, raw_coarse_gap, local_coarse_gap,
-        #  static_scale_raw, static_scale_local, static_scale_coarse]
-        #
-        # Added target-aware state:
-        #  target_raw_summary, target_local_summary, target_coarse_summary,
-        #  target_base_entropy,
-        #  target_scale_raw, target_scale_local, target_scale_coarse,
-        #  target_mean_like, target_std_like, target_recent_slope_like, target_scale_range,
-        #  target_raw_local_gap, target_raw_coarse_gap, target_local_coarse_gap
-        #
-        # Total = 11 + 14 = 25
+        # original 11 + target-aware 14 = 25
         self.state_dim = 25
 
     def _get_target_feature(self, x_bn):
@@ -63,13 +39,6 @@ class SelectionStateBuilder(nn.Module):
         returns target slice [B, 1]
         """
         return x_bn[:, self.target_index:self.target_index + 1] if self.target_index != -1 else x_bn[:, -1:]
-
-    def _get_target_feature_from_bnl(self, x_bnl):
-        """
-        x_bnl: [B, N, L]
-        returns target slice [B, 1, L]
-        """
-        return x_bnl[:, self.target_index:self.target_index + 1, :] if self.target_index != -1 else x_bnl[:, -1:, :]
 
     def forward(
         self,
@@ -97,9 +66,9 @@ class SelectionStateBuilder(nn.Module):
         scale_local = static_scale_weights[..., 1]    # [B, N]
         scale_coarse = static_scale_weights[..., 2]   # [B, N]
 
-        # ------------------------------------------------------------------
-        # Target-aware state enhancement
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
+        # target-aware features
+        # --------------------------------------------------------------
         target_raw_summary = self._get_target_feature(s_raw)          # [B, 1]
         target_local_summary = self._get_target_feature(s_local)      # [B, 1]
         target_coarse_summary = self._get_target_feature(s_coarse)    # [B, 1]
@@ -114,19 +83,15 @@ class SelectionStateBuilder(nn.Module):
         target_raw_coarse_gap = self._get_target_feature(raw_coarse_gap)      # [B, 1]
         target_local_coarse_gap = self._get_target_feature(local_coarse_gap)  # [B, 1]
 
-        # ------------------------------------------------------------------
-        # Regime-aware lightweight target statistics
-        # We keep minimal intrusion and derive them from already available
-        # target summaries / scales / entropy rather than changing external API.
-        # ------------------------------------------------------------------
-        # A proxy for target level
+        # --------------------------------------------------------------
+        # target-aware regime-like proxies
+        # --------------------------------------------------------------
         target_mean_like = (
             target_scale_raw * target_raw_summary +
             target_scale_local * target_local_summary +
             target_scale_coarse * target_coarse_summary
         )  # [B, 1]
 
-        # A proxy for target cross-scale dispersion
         target_std_like = torch.sqrt(
             (
                 (target_raw_summary - target_mean_like) ** 2 +
@@ -135,11 +100,8 @@ class SelectionStateBuilder(nn.Module):
             ) / 3.0 + self.eps
         )  # [B, 1]
 
-        # A lightweight proxy of "recent trend / slope":
-        # emphasize raw vs coarse discrepancy as local-vs-global difference
         target_recent_slope_like = target_raw_summary - target_coarse_summary  # [B, 1]
 
-        # A proxy for scale preference spread
         target_scale_range = torch.max(
             torch.cat([target_scale_raw, target_scale_local, target_scale_coarse], dim=-1),
             dim=-1,
@@ -150,8 +112,8 @@ class SelectionStateBuilder(nn.Module):
             keepdim=True
         )[0]  # [B, 1]
 
-        # Broadcast target-aware signals back to each variable dimension
         B, N = agg_repr.shape
+
         target_raw_summary_expand = target_raw_summary.expand(B, N)
         target_local_summary_expand = target_local_summary.expand(B, N)
         target_coarse_summary_expand = target_coarse_summary.expand(B, N)
@@ -171,9 +133,6 @@ class SelectionStateBuilder(nn.Module):
         target_raw_coarse_gap_expand = target_raw_coarse_gap.expand(B, N)
         target_local_coarse_gap_expand = target_local_coarse_gap.expand(B, N)
 
-        # ------------------------------------------------------------------
-        # Final state
-        # ------------------------------------------------------------------
         state = torch.stack(
             [
                 # original state
@@ -217,18 +176,19 @@ class SelectionStateBuilder(nn.Module):
 
 class ScalePreferenceActor(nn.Module):
     """
-    Stochastic actor for dynamic scale preference control.
+    Stochastic actor for residual-gated dynamic scale preference control.
 
     Input:
         state: [B, N, state_dim]
 
     Outputs:
-        action_mean:    [B, N, 3]
-        action_std:     [B, N, 3]
-        action_delta:   [B, N, 3]   (sampled action in bounded space)
-        log_prob:       [B, N]
-        entropy:        [B, N]
-        action_strength:[B, N]
+        action_mean:     [B, N, 3]
+        action_std:      [B, N, 3]
+        action_delta:    [B, N, 3]
+        gate_alpha:      [B, N, 1]   in [0, 1]
+        log_prob:        [B, N]
+        entropy:         [B, N]
+        action_strength: [B, N]
     """
 
     def __init__(self, state_dim, hidden_dim=64, action_scale=0.5):
@@ -242,8 +202,12 @@ class ScalePreferenceActor(nn.Module):
             nn.GELU()
         )
 
+        # stochastic action
         self.mean_head = nn.Linear(hidden_dim, 3)
         self.log_std_head = nn.Linear(hidden_dim, 3)
+
+        # residual gate
+        self.gate_head = nn.Linear(hidden_dim, 1)
 
         # bounded stochasticity for stable exploration
         self.min_log_std = -5.0
@@ -258,10 +222,10 @@ class ScalePreferenceActor(nn.Module):
         """
         h = self.backbone(state)
 
-        action_mean_raw = self.mean_head(h)               # [B, N, 3]
-        action_log_std = self.log_std_head(h)             # [B, N, 3]
+        action_mean_raw = self.mean_head(h)          # [B, N, 3]
+        action_log_std = self.log_std_head(h)        # [B, N, 3]
         action_log_std = torch.clamp(action_log_std, self.min_log_std, self.max_log_std)
-        action_std = torch.exp(action_log_std)            # [B, N, 3]
+        action_std = torch.exp(action_log_std)       # [B, N, 3]
 
         dist = Normal(action_mean_raw, action_std)
 
@@ -270,9 +234,13 @@ class ScalePreferenceActor(nn.Module):
         else:
             sampled_raw = dist.rsample()
 
+        # bounded residual correction
         action_delta = self.action_scale * torch.tanh(sampled_raw)  # [B, N, 3]
 
-        # lightweight approximation on pre-tanh action
+        # residual gate in [0,1]
+        gate_alpha = torch.sigmoid(self.gate_head(h))  # [B, N, 1]
+
+        # policy quantities
         log_prob = dist.log_prob(sampled_raw).sum(dim=-1)  # [B, N]
         entropy = dist.entropy().sum(dim=-1)               # [B, N]
 
@@ -282,6 +250,7 @@ class ScalePreferenceActor(nn.Module):
             'action_mean': action_mean_raw,
             'action_std': action_std,
             'action_delta': action_delta,
+            'gate_alpha': gate_alpha,
             'log_prob': log_prob,
             'entropy': entropy,
             'action_strength': action_strength
@@ -318,15 +287,12 @@ class DynamicSelectionController(nn.Module):
     """
     RL controller for target-aware multi-scale temporal selection refinement.
 
-    Static selector provides:
-        - branch logits: z_raw, z_local, z_coarse
-        - static scale fusion weights
-        - base weights
+    Residual-gated design:
+        dynamic scale preference is a gated residual correction over static scale preference:
+            S_dyn = Softmax( log(S_base + eps) + gate_alpha * action_delta )
 
-    RL controller dynamically adjusts scale preference:
-        static scale logits + sampled action_delta -> dynamic scale weights
-        dynamic scale weights fuse branch logits -> dynamic logits
-        dynamic logits -> dynamic temporal weights -> selected_x_dynamic
+    This makes the static selector the main path and dynamic RL only performs
+    conservative residual calibration.
     """
 
     def __init__(
@@ -394,6 +360,7 @@ class DynamicSelectionController(nn.Module):
 
         actor_out = self.actor(state, deterministic=deterministic)
         action_delta = actor_out['action_delta']        # [B, N, 3]
+        gate_alpha = actor_out['gate_alpha']            # [B, N, 1]
         log_prob = actor_out['log_prob']                # [B, N]
         entropy = actor_out['entropy']                  # [B, N]
         action_strength = actor_out['action_strength']  # [B, N]
@@ -402,9 +369,13 @@ class DynamicSelectionController(nn.Module):
 
         value = self.critic(state)                      # [B, N, 1]
 
-        # convert static scale weights to logits-like domain for additive correction
+        # -------------------------------------------------------------
+        # Residual-gated dynamic scale preference
+        # S_dyn = Softmax( log(S_base + eps) + gate_alpha * action_delta )
+        # -------------------------------------------------------------
         static_scale_logits = torch.log(static_scale_weights + self.eps)      # [B, N, 3]
-        dynamic_scale_logits = static_scale_logits + action_delta             # [B, N, 3]
+        gated_residual = gate_alpha * action_delta                            # [B, N, 3]
+        dynamic_scale_logits = static_scale_logits + gated_residual           # [B, N, 3]
         dynamic_scale_weights = torch.softmax(dynamic_scale_logits, dim=-1)   # [B, N, 3]
 
         w_raw = dynamic_scale_weights[..., 0].unsqueeze(-1)      # [B, N, 1]
@@ -431,11 +402,12 @@ class DynamicSelectionController(nn.Module):
             'action_mean': action_mean,                  # [B, N, 3]
             'action_std': action_std,                    # [B, N, 3]
             'action_delta': action_delta,                # [B, N, 3]
+            'gate_alpha': gate_alpha,                    # [B, N, 1]
             'log_prob': log_prob,                        # [B, N]
             'entropy': entropy,                          # [B, N]
             'action_strength': action_strength,          # [B, N]
 
-            # dynamic scale preference
+            # residual-gated dynamic scale preference
             'dynamic_scale_logits': dynamic_scale_logits,      # [B, N, 3]
             'dynamic_scale_weights': dynamic_scale_weights,    # [B, N, 3]
 
