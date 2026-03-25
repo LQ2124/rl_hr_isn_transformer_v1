@@ -27,12 +27,23 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         self.use_dynamic_rl = getattr(args, 'use_dynamic_rl', 0)
         self.eta_a = getattr(args, 'eta_a', 0.0)
         self.eta_c = getattr(args, 'eta_c', 0.0)
+        self.eta_ent = getattr(args, 'eta_ent', 0.0)
         self.rl_warmup_epochs = getattr(args, 'rl_warmup_epochs', 0)
         self.reward_type = getattr(args, 'reward_type', 'improve_over_static')
         self.reward_scale = getattr(args, 'reward_scale', 1.0)
 
-        # optional entropy regularization for stochastic policy
-        self.eta_ent = getattr(args, 'eta_ent', 0.0)
+        # -------- difficulty-aware reward configs --------
+        self.reward_use_load_weight = getattr(args, 'reward_use_load_weight', 1)
+        self.reward_load_alpha = getattr(args, 'reward_load_alpha', 1.0)
+
+        self.reward_use_ramp_weight = getattr(args, 'reward_use_ramp_weight', 0)
+        self.reward_ramp_beta = getattr(args, 'reward_ramp_beta', 1.0)
+
+        # -------- mixed reward configs --------
+        # relative reward weight
+        self.reward_rel_lambda = getattr(args, 'reward_rel_lambda', 1.0)
+        # absolute target-fitting reward weight
+        self.reward_abs_lambda = getattr(args, 'reward_abs_lambda', 0.2)
 
     def _build_model(self):
         model = self.model_dict[self.args.model](self.args).float()
@@ -80,8 +91,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             before warmup epochs, disable RL losses
         """
         if epoch < self.rl_warmup_epochs:
-            return 0.0, 0.0
-        return self.eta_a, self.eta_c
+            return 0.0, 0.0, 0.0
+        return self.eta_a, self.eta_c, self.eta_ent
 
     def _compute_reward(self, static_loss_var, dynamic_loss_var):
         """
@@ -105,22 +116,14 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
     def _align_aux_with_target_dim(self, aux_tensor, target_tensor):
         """
-        Align aux outputs (e.g., static_pred / value / action_strength / log_prob / entropy)
-        with target output dimensionality after trainer-side f_dim slicing.
-
-        aux_tensor examples:
-            static_pred      [B, pred_len, N]
-            value            [B, N, 1] or [B, N]
-            action_strength  [B, N]
-            log_prob         [B, N]
-            entropy          [B, N]
+        Align aux outputs with trainer-side target dimensionality after f_dim slicing.
         """
         if aux_tensor is None:
             return None
 
         target_c = target_tensor.shape[-1]
 
-        # Case 1: prediction-like tensor [B, T, C]
+        # prediction-like tensor [B, T, C]
         if aux_tensor.dim() == 3 and aux_tensor.shape[1] == target_tensor.shape[1]:
             aux_c = aux_tensor.shape[-1]
             if aux_c == target_c:
@@ -130,7 +133,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             else:
                 return aux_tensor[:, :, :target_c]
 
-        # Case 2: per-variable tensor [B, C]
+        # per-variable tensor [B, C]
         if aux_tensor.dim() == 2:
             aux_c = aux_tensor.shape[-1]
             if aux_c == target_c:
@@ -140,7 +143,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             else:
                 return aux_tensor[:, :target_c]
 
-        # Case 3: per-variable tensor [B, C, 1]
+        # per-variable tensor [B, C, 1]
         if aux_tensor.dim() == 3 and aux_tensor.shape[-1] == 1:
             aux_c = aux_tensor.shape[1]
             if aux_c == target_c:
@@ -152,20 +155,53 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         return aux_tensor
 
+    def _compute_difficulty_weight(self, batch_y_target):
+        """
+        Construct a difficulty-aware reward weight from target signal.
+
+        batch_y_target: [B, pred_len, C]
+
+        Returns:
+            difficulty_weight: [B, C]
+        """
+        difficulty_weight = torch.ones_like(batch_y_target.mean(dim=1))  # [B, C]
+
+        # -------------------------------------------------------------
+        # 1) High-load weighting
+        # -------------------------------------------------------------
+        if self.reward_use_load_weight:
+            load_level = batch_y_target.abs().mean(dim=1)  # [B, C]
+            load_level_norm = load_level / (load_level.mean(dim=0, keepdim=True) + 1e-8)
+
+            load_weight = 1.0 + self.reward_load_alpha * load_level_norm
+            difficulty_weight = difficulty_weight * load_weight
+
+        # -------------------------------------------------------------
+        # 2) Ramp / variation weighting
+        # -------------------------------------------------------------
+        if self.reward_use_ramp_weight:
+            if batch_y_target.shape[1] > 1:
+                ramp_strength = torch.abs(batch_y_target[:, 1:, :] - batch_y_target[:, :-1, :]).mean(dim=1)  # [B, C]
+            else:
+                ramp_strength = torch.zeros_like(batch_y_target.mean(dim=1))
+
+            ramp_norm = ramp_strength / (ramp_strength.mean(dim=0, keepdim=True) + 1e-8)
+            ramp_weight = 1.0 + self.reward_ramp_beta * ramp_norm
+            difficulty_weight = difficulty_weight * ramp_weight
+
+        return difficulty_weight  # [B, C]
+
     def _compute_rl_losses(self, aux, dynamic_pred, batch_y_target, criterion):
         """
-        Compute RL losses using real forecasting targets.
+        Compute RL losses using stochastic actor outputs.
 
-        Inputs:
-            aux should contain:
-                - static_pred: [B, pred_len, C_full] or aligned
-                - value: [B, N, 1] or compatible
-                - log_prob: [B, N]
-                - entropy: [B, N] (optional)
-        Returns:
-            rl_items dict
+        Required keys in aux:
+            - static_pred
+            - value
+            - log_prob
+            - entropy
         """
-        required_keys = ['static_pred', 'value', 'log_prob']
+        required_keys = ['static_pred', 'value', 'log_prob', 'entropy']
         if not all(k in aux for k in required_keys):
             zero = dynamic_pred.new_tensor(0.0)
             return {
@@ -184,17 +220,18 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         static_pred = aux['static_pred']
         value = aux['value']
         log_prob = aux['log_prob']
-        entropy = aux.get('entropy', None)
+        entropy = aux['entropy']
 
-        # -------- IMPORTANT ALIGNMENT --------
+        # align aux tensors to target dimension
         static_pred = self._align_aux_with_target_dim(static_pred, batch_y_target)
         value = self._align_aux_with_target_dim(value, batch_y_target)
         log_prob = self._align_aux_with_target_dim(log_prob, batch_y_target)
-        if entropy is not None:
-            entropy = self._align_aux_with_target_dim(entropy, batch_y_target)
+        entropy = self._align_aux_with_target_dim(entropy, batch_y_target)
 
+        # -------------------------------------------------------------
         # Per-variable forecasting loss over prediction horizon
         # [B, pred_len, C] -> mean over time dim => [B, C]
+        # -------------------------------------------------------------
         if isinstance(criterion, nn.MSELoss):
             static_loss_var = ((static_pred - batch_y_target) ** 2).mean(dim=1)
             dynamic_loss_var = ((dynamic_pred - batch_y_target) ** 2).mean(dim=1)
@@ -226,29 +263,64 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         static_sup_loss = static_loss_var.mean()
         dynamic_sup_loss = dynamic_loss_var.mean()
 
-        reward = self._compute_reward(static_loss_var.detach(), dynamic_loss_var.detach())  # [B, C]
+        # -------------------------------------------------------------
+        # Relative reward: dynamic improvement over static
+        # -------------------------------------------------------------
+        relative_reward = self._compute_reward(
+            static_loss_var.detach(),
+            dynamic_loss_var.detach()
+        )  # [B, C]
 
+        # -------------------------------------------------------------
+        # Absolute reward: directly encourage dynamic target fitting
+        # -------------------------------------------------------------
+        absolute_reward = -dynamic_loss_var.detach()  # [B, C]
+
+        # -------------------------------------------------------------
+        # Mixed reward
+        # -------------------------------------------------------------
+        mixed_reward = (
+            self.reward_rel_lambda * relative_reward +
+            self.reward_abs_lambda * absolute_reward
+        )  # [B, C]
+
+        # -------------------------------------------------------------
+        # Difficulty-aware weighting
+        # -------------------------------------------------------------
+        difficulty_weight = self._compute_difficulty_weight(batch_y_target).detach()  # [B, C]
+        reward = difficulty_weight * mixed_reward  # [B, C]
+
+        # critic output alignment
         if value.dim() == 3:
-            value_pred = value.squeeze(-1)   # [B, C]
+            value_pred = value.squeeze(-1)
         else:
-            value_pred = value               # [B, C]
+            value_pred = value
 
-        advantage = reward - value_pred      # [B, C]
+        # raw advantage (no aggressive normalization)
+        advantage = reward - value_pred
 
-        # ------------------ KEY CHANGE ------------------
-        # True policy-gradient-style surrogate:
-        # encourage actions with high advantage and suppress those with low advantage
-        actor_loss = -(log_prob * advantage.detach()).mean()
+        # log_prob alignment
+        if log_prob.dim() == 3:
+            log_prob_used = log_prob.squeeze(-1)
+        else:
+            log_prob_used = log_prob
 
+        # entropy alignment
+        if entropy.dim() == 3:
+            entropy_used = entropy.squeeze(-1)
+        else:
+            entropy_used = entropy
+
+        # -------------------------------------------------------------
+        # Policy gradient style actor loss
+        # -------------------------------------------------------------
+        actor_loss = -(log_prob_used * advantage.detach()).mean()
+
+        # critic fits raw mixed difficulty-aware reward
         critic_loss = nn.functional.mse_loss(value_pred, reward.detach())
 
-        if entropy is not None:
-            # maximize entropy <=> minimize negative entropy
-            entropy_loss = -entropy.mean()
-            entropy_mean = entropy.detach().mean().item()
-        else:
-            entropy_loss = dynamic_pred.new_tensor(0.0)
-            entropy_mean = 0.0
+        # entropy regularization term (weighted outside)
+        entropy_loss = -entropy_used.mean()
 
         return {
             'static_sup_loss': static_sup_loss,
@@ -260,7 +332,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             'entropy_loss': entropy_loss,
             'reward_mean': reward.detach().mean().item(),
             'advantage_mean': advantage.detach().mean().item(),
-            'entropy_mean': entropy_mean
+            'entropy_mean': entropy_used.detach().mean().item()
         }
 
     def _compute_total_loss(self, outputs, batch_y, criterion, aux=None, epoch=0, return_items=False):
@@ -275,23 +347,25 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         sup_loss = criterion(outputs, batch_y)
         sparse_loss = aux.get('sparse_loss', sup_loss.new_tensor(0.0))
 
+        # RL losses
         rl_items = self._compute_rl_losses(aux, outputs, batch_y, criterion)
         actor_loss = rl_items['actor_loss']
         critic_loss = rl_items['critic_loss']
         entropy_loss = rl_items['entropy_loss']
 
-        eta_a_eff, eta_c_eff = self._get_rl_weights(epoch)
+        eta_a_eff, eta_c_eff, eta_ent_eff = self._get_rl_weights(epoch)
 
         if not self.use_dynamic_rl:
             eta_a_eff = 0.0
             eta_c_eff = 0.0
+            eta_ent_eff = 0.0
 
         total_loss = (
             sup_loss
             + self.sparse_lambda * sparse_loss
             + eta_a_eff * actor_loss
             + eta_c_eff * critic_loss
-            + self.eta_ent * entropy_loss
+            + eta_ent_eff * entropy_loss
         )
 
         if return_items:
@@ -308,7 +382,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 'advantage_mean': rl_items['advantage_mean'],
                 'entropy_mean': rl_items['entropy_mean'],
                 'eta_a_eff': eta_a_eff,
-                'eta_c_eff': eta_c_eff
+                'eta_c_eff': eta_c_eff,
+                'eta_ent_eff': eta_ent_eff
             }
 
         return total_loss
@@ -484,7 +559,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                         )
                     )
                     print("\tRL weights -> eta_a_eff: {:.6f}, eta_c_eff: {:.6f}, eta_ent: {:.6f}".format(
-                        loss_items['eta_a_eff'], loss_items['eta_c_eff'], self.eta_ent
+                        loss_items['eta_a_eff'], loss_items['eta_c_eff'], loss_items['eta_ent_eff']
                     ))
 
                     speed = (time.time() - time_now) / iter_count
